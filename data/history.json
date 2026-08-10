@@ -1,0 +1,119 @@
+[
+  {
+    "id": "20260810_105508",
+    "uploaded_at": "2026-08-10 10:55:08",
+    "records": [
+      {
+        "Location": "BLR7",
+        "CityCode": "BLR",
+        "MSKU": "PT16RG",
+        "sellable": 7,
+        "in_transit": 0
+      },
+      {
+        "Location": "BLR8",
+        "CityCode": "BLR",
+        "MSKU": "MT1",
+        "sellable": 7,
+        "in_transit": 0
+      },
+      {
+        "Location": "BLR8",
+        "CityCode": "BLR",
+        "MSKU": "PT16",
+        "sellable": 20,
+        "in_transit": 0
+      },
+      {
+        "Location": "BLR8",
+        "CityCode": "BLR",
+        "MSKU": "PT16G",
+        "sellable": 9,
+        "in_transit": 0
+      },
+      {
+        "Location": "BLR8",
+        "CityCode": "BLR",
+        "MSKU": "PT16RG",
+        "sellable": 8,
+        "in_transit": 0
+      },
+      {
+        "Location": "BOM5",
+        "CityCode": "BOM",
+        "MSKU": "PT16G",
+        "sellable": 20,
+        "in_transit": 0
+      },
+      {
+        "Location": "BOM7",
+        "CityCode": "BOM",
+        "MSKU": "MT1",
+        "sellable": 1,
+        "in_transit": 0
+      },
+      {
+        "Location": "BOM7",
+        "CityCode": "BOM",
+        "MSKU": "PT16",
+        "sellable": 4,
+        "in_transit": 0
+      },
+      {
+        "Location": "BOM7",
+        "CityCode": "BOM",
+        "MSKU": "PT16RG",
+        "sellable": 6,
+        "in_transit": 0
+      },
+      {
+        "Location": "CJB1",
+        "CityCode": "CJB",
+        "MSKU": "PT16G",
+        "sellable": 17,
+        "in_transit": 0
+      },
+      {
+        "Location": "CJB1",
+        "CityCode": "CJB",
+        "MSKU": "PT16RG",
+        "sellable": 23,
+        "in_transit": 0
+      },
+      {
+        "Location": "DEL4",
+        "CityCode": "DEL",
+        "MSKU": "PT16G",
+        "sellable": 17,
+        "in_transit": 0
+      },
+      {
+        "Location": "DEL5",
+        "CityCode": "DEL",
+        "MSKU": "DG1",
+        "sellable": 3,
+        "in_transit": 0
+      },
+      {
+        "Location": "DEL5",
+        "CityCode": "DEL",
+        "MSKU": "PT16G",
+        "sellable": 22,
+        "in_transit": 0
+      },
+      {
+        "Location": "DEL5",
+        "CityCode": "DEL",
+        "MSKU": "PT16RG",
+        "sellable": 40,
+        "in_transit": 0
+      }
+    ],
+    "summary": {
+      "warehouses": 7,
+      "mskus": 5,
+      "total_sellable": 204,
+      "total_in_transit": 0
+    }
+  }
+]

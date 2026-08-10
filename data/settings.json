@@ -1,0 +1,12 @@
+{
+  "enabled": true,
+  "global_threshold": 5,
+  "scope": "per_city",
+  "sku_overrides": {
+    "DG1": 20,
+    "PT16": 15,
+    "PT16G": 15,
+    "PT16RG": 15,
+    "MT1": 10
+  }
+}
