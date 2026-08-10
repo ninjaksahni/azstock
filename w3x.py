@@ -30,12 +30,41 @@ DATA_DIR = Path(__file__).parent / "data"
 LOCATIONS_FILE = DATA_DIR / "warehouse_locations.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 HISTORY_FILE = DATA_DIR / "history.json"
+LIS_RADIUS_KM = 300
+LIS_CIRCLE_COLORS = (
+    "#9b59b6",
+    "#e74c3c",
+    "#3498db",
+    "#2ecc71",
+    "#f39c12",
+    "#1abc9c",
+    "#e67e22",
+    "#34495e",
+    "#16a085",
+    "#c0392b",
+    "#8e44ad",
+    "#2980b9",
+    "#27ae60",
+    "#d35400",
+    "#7f8c8d",
+    "#6c5ce7",
+    "#fd79a8",
+    "#00b894",
+    "#636e72",
+    "#e17055",
+)
+
+
+def lis_circle_color(loc: str) -> str:
+    return LIS_CIRCLE_COLORS[sum(ord(c) for c in loc) % len(LIS_CIRCLE_COLORS)]
 
 DEFAULT_SETTINGS = {
     "enabled": True,
     "global_threshold": 10,
     "scope": "per_city",
     "sku_overrides": {},
+    "selected_cities": [],
+    "excluded_warehouses": [],
 }
 
 
@@ -286,7 +315,7 @@ def compute_low_stock_alerts(agg: pd.DataFrame, settings: dict) -> dict:
     if not settings.get("enabled", True):
         return empty
 
-    expanded = expand_city_warehouse_stock(agg)
+    expanded = expand_city_warehouse_stock(agg, settings)
     flagged_skus: set[tuple[str, str]] = set()
     alerts: list[dict] = []
 
@@ -409,8 +438,77 @@ def known_warehouses_df() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def expand_city_warehouse_stock(agg: pd.DataFrame) -> pd.DataFrame:
-    """All known FCs × all MSKUs present in the upload, zero-filled where absent."""
+def all_city_options(agg: pd.DataFrame | None = None) -> list[str]:
+    options = set(known_warehouses_df()["CityCode"].tolist())
+    if agg is not None and not agg.empty:
+        options.update(agg["CityCode"].astype(str).unique())
+    return sorted(options)
+
+
+def effective_selected_cities(settings: dict, agg: pd.DataFrame | None = None) -> list[str]:
+    all_cities = all_city_options(agg)
+    selected = settings.get("selected_cities")
+    if selected is None and settings.get("selected_warehouses"):
+        selected = sorted({extract_city_code(wh) for wh in settings["selected_warehouses"]})
+    selected = selected or []
+    if not selected:
+        return all_cities
+    filtered = [city for city in selected if city in all_cities]
+    return filtered or all_cities
+
+
+def warehouses_for_cities(city_codes: list[str], agg: pd.DataFrame | None = None) -> list[str]:
+    allowed = set(city_codes)
+    warehouses = set(
+        known_warehouses_df()
+        .loc[lambda df: df["CityCode"].isin(allowed), "Location"]
+        .tolist()
+    )
+    if agg is not None and not agg.empty:
+        warehouses.update(
+            agg.loc[agg["CityCode"].isin(allowed), "Location"].astype(str).tolist()
+        )
+    return sorted(warehouses)
+
+
+def excluded_warehouses(settings: dict) -> set[str]:
+    return set(settings.get("excluded_warehouses") or [])
+
+
+def effective_warehouses(settings: dict, agg: pd.DataFrame | None = None) -> list[str]:
+    cities = effective_selected_cities(settings, agg)
+    warehouses = warehouses_for_cities(cities, agg)
+    excluded = excluded_warehouses(settings)
+    return [loc for loc in warehouses if loc not in excluded]
+
+
+def recompute_city_agg(agg: pd.DataFrame) -> pd.DataFrame:
+    if agg.empty:
+        return agg.copy()
+    city_parts = {"Ending Warehouse Balance": "sum"}
+    if "In Transit Between Warehouses" in agg.columns:
+        city_parts["In Transit Between Warehouses"] = "sum"
+    return agg.groupby(["CityCode", "MSKU"], as_index=False).agg(city_parts)
+
+
+def apply_city_filter(
+    agg: pd.DataFrame,
+    city_agg: pd.DataFrame,
+    settings: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    cities = effective_selected_cities(settings, agg)
+    if not cities:
+        empty = agg.iloc[0:0].copy()
+        return empty, recompute_city_agg(empty)
+    filtered = agg[agg["CityCode"].isin(cities)].copy()
+    excluded = excluded_warehouses(settings)
+    if excluded:
+        filtered = filtered[~filtered["Location"].astype(str).isin(excluded)].copy()
+    return filtered, recompute_city_agg(filtered)
+
+
+def expand_city_warehouse_stock(agg: pd.DataFrame, settings: dict | None = None) -> pd.DataFrame:
+    """Selected cities' FCs × all MSKUs present in the upload, zero-filled where absent."""
     stock = (
         agg.groupby(["Location", "CityCode", "MSKU"], as_index=False)["Ending Warehouse Balance"]
         .sum()
@@ -422,6 +520,12 @@ def expand_city_warehouse_stock(agg: pd.DataFrame) -> pd.DataFrame:
         .drop_duplicates(subset=["Location"])
         .sort_values(["CityCode", "Location"])
     )
+    if settings is not None:
+        cities = set(effective_selected_cities(settings, agg))
+        warehouses = warehouses[warehouses["CityCode"].isin(cities)]
+        excluded = excluded_warehouses(settings)
+        if excluded:
+            warehouses = warehouses[~warehouses["Location"].isin(excluded)]
     all_mskus = sorted(stock["MSKU"].unique())
     rows: list[dict] = []
 
@@ -445,7 +549,7 @@ def expand_city_warehouse_stock(agg: pd.DataFrame) -> pd.DataFrame:
 
 def build_send_plan(agg: pd.DataFrame, settings: dict) -> pd.DataFrame:
     """Warehouse-level send plan — zero stock shown at every FC missing an MSKU."""
-    expanded = expand_city_warehouse_stock(agg)
+    expanded = expand_city_warehouse_stock(agg, settings)
     rows: list[dict] = []
 
     for _, row in expanded.iterrows():
@@ -707,6 +811,22 @@ def _location_totals(agg: pd.DataFrame) -> pd.DataFrame:
     return totals
 
 
+def map_location_totals(agg: pd.DataFrame, settings: dict) -> pd.DataFrame:
+    """All warehouses in selected cities (minus exclusions), with zero sellable where absent from upload."""
+    warehouses = effective_warehouses(settings, agg)
+    totals = _location_totals(agg)
+    sellable_by_loc = totals.set_index("Location")["sellable"].to_dict() if not totals.empty else {}
+    rows = [
+        {
+            "Location": loc,
+            "CityCode": extract_city_code(loc),
+            "sellable": int(sellable_by_loc.get(loc, 0)),
+        }
+        for loc in warehouses
+    ]
+    return pd.DataFrame(rows)
+
+
 def build_warehouse_map(
     agg: pd.DataFrame,
     locations_db: dict,
@@ -715,12 +835,31 @@ def build_warehouse_map(
     alerts_data: dict | None = None,
     show_low_stock_only: bool = False,
     scope: str = "per_city",
+    show_lis_radius: bool = False,
+    satellite_view: bool = False,
+    settings: dict | None = None,
 ) -> tuple[folium.Map, list[str]]:
     alerts_data = alerts_data or compute_low_stock_alerts(agg, {"enabled": False})
-    loc_totals = _location_totals(agg)
+    loc_totals = map_location_totals(agg, settings) if settings else _location_totals(agg)
     unmapped = [loc for loc in loc_totals["Location"] if loc not in locations_db]
 
-    m = folium.Map(location=[20.6, 78.9], zoom_start=4, tiles="OpenStreetMap")
+    if satellite_view:
+        m = folium.Map(location=[20.6, 78.9], zoom_start=4, tiles=None)
+        folium.TileLayer(
+            tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+            attr="Esri World Imagery",
+            overlay=False,
+            control=False,
+        ).add_to(m)
+        folium.TileLayer(
+            "OpenStreetMap",
+            overlay=True,
+            control=False,
+            opacity=0.6,
+            show=True,
+        ).add_to(m)
+    else:
+        m = folium.Map(location=[20.6, 78.9], zoom_start=4, tiles="OpenStreetMap")
 
     if mode == "All warehouses":
         for _, row in loc_totals.iterrows():
@@ -762,6 +901,19 @@ def build_warehouse_map(
             tooltip = f"{loc} — {sellable:,} sellable"
             if alert_n:
                 tooltip += f" · ⚠️ {alert_n} alert{'s' if alert_n != 1 else ''}"
+
+            if show_lis_radius:
+                lis_color = lis_circle_color(loc)
+                folium.Circle(
+                    location=[lat, lng],
+                    radius=LIS_RADIUS_KM * 1000,
+                    color=lis_color,
+                    fill=True,
+                    fill_color=lis_color,
+                    fill_opacity=0.12,
+                    weight=2,
+                    tooltip=f"{loc} — {LIS_RADIUS_KM} km LIS radius",
+                ).add_to(m)
 
             folium.CircleMarker(
                 location=[lat, lng],
@@ -839,7 +991,7 @@ def build_warehouse_map(
 
 def render_settings_panel(settings: dict, agg: pd.DataFrame | None = None) -> dict:
     st.subheader("⚙️ Alert thresholds")
-    st.caption("Each warehouse is checked separately. If an MSKU appears anywhere, every FC in the upload is listed (0 where absent).")
+    st.caption("Each warehouse is checked separately. If an MSKU appears anywhere, every FC in selected cities is listed (0 where absent).")
 
     settings["enabled"] = st.checkbox(
         "Enable low-stock alerts",
@@ -851,6 +1003,49 @@ def render_settings_panel(settings: dict, agg: pd.DataFrame | None = None) -> di
         value=int(settings.get("global_threshold", 10)),
     )
     settings["scope"] = "per_city"
+
+    st.divider()
+    st.subheader("🏙️ Cities")
+    city_options = all_city_options(agg)
+    saved_cities = settings.get("selected_cities")
+    if saved_cities is None and settings.get("selected_warehouses"):
+        saved_cities = sorted({extract_city_code(wh) for wh in settings["selected_warehouses"]})
+    saved_cities = saved_cities or []
+    default_cities = [city for city in saved_cities if city in city_options] or city_options
+    settings["selected_cities"] = st.multiselect(
+        "Cities to include",
+        options=city_options,
+        default=default_cities,
+        format_func=lambda code: f"{city_display_name(code)} ({code})",
+        help="All warehouses in a selected city are included. Save settings to apply.",
+        key="settings_selected_cities",
+    )
+    if settings["selected_cities"]:
+        enabled_wh = effective_warehouses(settings, agg)
+        excluded = excluded_warehouses(settings)
+        if excluded:
+            st.caption(
+                f"**{len(enabled_wh)}** warehouses enabled "
+                f"({len(excluded)} excluded: {', '.join(sorted(excluded))})"
+            )
+        else:
+            st.caption(f"**{len(enabled_wh)}** warehouses enabled: {', '.join(enabled_wh)}")
+    else:
+        st.warning("Select at least one city, then click **Save settings**.")
+
+    st.divider()
+    st.subheader("🏭 Warehouses")
+    warehouse_options = warehouses_for_cities(settings["selected_cities"] or [], agg)
+    saved_excluded = [
+        wh for wh in (settings.get("excluded_warehouses") or []) if wh in warehouse_options
+    ]
+    settings["excluded_warehouses"] = st.multiselect(
+        "Excluded warehouses",
+        options=warehouse_options,
+        default=saved_excluded,
+        help="These FCs are omitted from Send Plan, Overview, and Map.",
+        key="settings_excluded_warehouses",
+    )
 
     if agg is not None:
         st.divider()
@@ -896,6 +1091,10 @@ def render_settings_panel(settings: dict, agg: pd.DataFrame | None = None) -> di
     sc1, sc2 = st.columns(2)
     with sc1:
         if st.button("Save settings", type="primary"):
+            wh_opts = set(warehouses_for_cities(settings.get("selected_cities") or [], agg))
+            settings["excluded_warehouses"] = [
+                wh for wh in (settings.get("excluded_warehouses") or []) if wh in wh_opts
+            ]
             st.session_state.settings = settings
             save_settings(settings)
             st.success("Settings saved.")
@@ -1234,7 +1433,7 @@ def render_overview_tab(
 def render_map_tab(agg: pd.DataFrame, settings: dict, alerts_data: dict) -> None:
     st.subheader("🗺️ Warehouse map")
     locations_db = load_warehouse_locations()
-    city_options = sorted(agg["CityCode"].unique())
+    city_options = effective_selected_cities(settings, agg)
     city_labels = {c: city_display_name(c) for c in city_options}
 
     mc1, mc2, mc3 = st.columns([1, 2, 1])
@@ -1246,9 +1445,18 @@ def render_map_tab(agg: pd.DataFrame, settings: dict, alerts_data: dict) -> None
             city_options,
             default=city_options,
             format_func=lambda c: f"{city_labels[c]} ({c})",
+            help="Limited to cities enabled in History & Settings.",
         )
     with mc3:
         show_low_only = st.checkbox("Low stock only", value=True)
+
+    opt1, opt2 = st.columns(2)
+    with opt1:
+        satellite_view = st.checkbox("Satellite view", value=False)
+    with opt2:
+        show_lis_radius = False
+        if map_mode == "All warehouses":
+            show_lis_radius = st.checkbox("SHOW LIS RADIUS", value=False)
 
     warehouse_map, unmapped = build_warehouse_map(
         agg,
@@ -1258,6 +1466,9 @@ def render_map_tab(agg: pd.DataFrame, settings: dict, alerts_data: dict) -> None
         alerts_data=alerts_data,
         show_low_stock_only=show_low_only,
         scope="per_city",
+        show_lis_radius=show_lis_radius,
+        satellite_view=satellite_view,
+        settings=settings,
     )
     if unmapped:
         st.warning(f"Unmapped warehouses: {', '.join(unmapped)}")
@@ -1300,6 +1511,16 @@ def render_app(
 
     settings = st.session_state.settings
     settings["scope"] = "per_city"
+    agg, city_agg = apply_city_filter(agg, city_agg, settings)
+    if agg.empty:
+        st.warning("No data for the cities selected in **History & Settings**. Select at least one city and save.")
+        tab_history = st.tabs(["⚙️ History & Settings"])[0]
+        with tab_history:
+            render_history_panel()
+            st.divider()
+            settings = render_settings_panel(settings, agg)
+        return
+
     alerts_data = compute_low_stock_alerts(agg, settings)
     send_plan = build_send_plan(agg, settings)
 

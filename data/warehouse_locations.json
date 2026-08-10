@@ -3,184 +3,184 @@
     "name": "Amazon FC BLR4",
     "city": "Devanahalli",
     "state": "Karnataka",
-    "address": "Plot No. 12/P2, Hitech Defence and Aerospace Park, Devanahalli, Bengaluru 562149",
-    "lat": 13.2472,
-    "lng": 77.7084
+    "address": "Plot No. 12/P2 (IT Sector), Hitech Defence and Aerospace Park, Devanahalli, Bengaluru 562149",
+    "lat": 13.223,
+    "lng": 77.7708
   },
   "BLR5": {
     "name": "Amazon FC BLR5",
     "city": "Hoskote",
     "state": "Karnataka",
-    "address": "38-39 Soukya Road, Kacharakanahalli, Hoskote, Karnataka 560067",
-    "lat": 13.0708,
-    "lng": 77.7978
+    "address": "Survey No 38/2, 39 and 40, Soukya Road, Kacharakanahalli, Hoskote, Bengaluru 562114",
+    "lat": 12.988726,
+    "lng": 77.808935
   },
   "BLR7": {
     "name": "Amazon FC BLR7",
     "city": "Anekal",
     "state": "Karnataka",
-    "address": "Thattanahalli & Madivala Village, Anekal Taluk, Bengaluru 562107",
-    "lat": 12.7484,
-    "lng": 77.7338
+    "address": "Survey No. 51/1, Thatanahalli Village, Anekal Taluk, Bengaluru 562107",
+    "lat": 12.748395,
+    "lng": 77.733837
   },
   "BLR8": {
     "name": "Amazon FC BLR8",
     "city": "Devanahalli",
     "state": "Karnataka",
-    "address": "Building 2, Plot No. 12/P2, Hitech Defence and Aerospace Park, Devanahalli, Bengaluru 562149",
-    "lat": 13.2485,
-    "lng": 77.7098
+    "address": "Building 2, Plot No. 12/P2 (IT Sector), Hitech Defence and Aerospace Park, Devanahalli, Bengaluru 562149",
+    "lat": 13.2236,
+    "lng": 77.7716
   },
   "BOM1": {
     "name": "Amazon FC BOM1",
     "city": "Bhiwandi",
     "state": "Maharashtra",
-    "address": "Sonale Village, Bhiwandi, Maharashtra 421302",
-    "lat": 19.2812,
-    "lng": 73.0521
+    "address": "Building A, F & H, Prathamesh Complex, Saravali Village, Near Kalyan-Bhiwandi Junction, Bhiwandi 421302",
+    "lat": 19.275467,
+    "lng": 73.086388
   },
   "BOM3": {
     "name": "Amazon FC BOM3",
     "city": "Bhiwandi",
     "state": "Maharashtra",
-    "address": "K-Square Industrial and Logistics Park, Kurund, Bhiwandi, Maharashtra 421302",
-    "lat": 19.2950,
-    "lng": 73.0610
+    "address": "K-Square Industrial and Logistics Park, WH 5/2, Village Kurund, Bhiwandi, Maharashtra 421302",
+    "lat": 19.361667,
+    "lng": 73.156111
   },
   "BOM4": {
     "name": "Amazon FC BOM4",
     "city": "Bhiwandi",
     "state": "Maharashtra",
-    "address": "Vashere, Bhiwandi, Maharashtra 421302",
-    "lat": 19.2780,
-    "lng": 73.0480
+    "address": "WB 10/11, Renaissance Industrial Park, Village Vashere, Post Amane, Bhiwandi, Maharashtra 421302",
+    "lat": 19.32918,
+    "lng": 73.164353
   },
   "BOM5": {
     "name": "Amazon FC BOM5",
     "city": "Bhiwandi",
     "state": "Maharashtra",
-    "address": "Renaissance Industrial Smart City, Vashere, Bhiwandi, Maharashtra 421302",
-    "lat": 19.2765,
-    "lng": 73.0465
+    "address": "Building WE-I, Renaissance Industrial Smart City, Kalyan-Sape Road, Vashere, Bhiwandi, Maharashtra 421302",
+    "lat": 19.332096,
+    "lng": 73.161565
   },
   "BOM6": {
     "name": "Amazon FC BOM6",
     "city": "Mumbai",
     "state": "Maharashtra",
     "address": "Akurli Industry Estate, Kandivali East, Mumbai 400101",
-    "lat": 19.2050,
-    "lng": 72.8750
+    "lat": 19.202479,
+    "lng": 72.855112
   },
   "BOM7": {
     "name": "Amazon FC BOM7",
     "city": "Bhiwandi",
     "state": "Maharashtra",
-    "address": "BGR Warehousing Complex, Village Vahuli, Bhiwandi, Thane 421302",
-    "lat": 19.3020,
-    "lng": 73.0780
+    "address": "Building 5, BGR Warehousing Complex, Village Vahuli, Mumbai-Nashik Expressway, Bhiwandi 421302",
+    "lat": 19.28983,
+    "lng": 73.099017
   },
   "BOM9": {
     "name": "Amazon FC BOM9",
     "city": "Bhiwandi",
     "state": "Maharashtra",
-    "address": "Vahuli Gaon, Mumbai-Nashik Expy, Bhiwandi, Maharashtra 421101",
-    "lat": 19.2980,
-    "lng": 73.0720
+    "address": "Vahuli Gaon, Jai Bhagwan Complex, Mumbai-Nashik Expressway, Bhiwandi, Maharashtra 421101",
+    "lat": 19.34773,
+    "lng": 73.149026
   },
   "CJB1": {
     "name": "Amazon FC CJB1",
     "city": "Coimbatore",
     "state": "Tamil Nadu",
-    "address": "Chettipalayam, Palladam Main Road, Coimbatore 641201",
-    "lat": 10.9233,
-    "lng": 77.0542
+    "address": "Survey No.153-1, Chettipalayam, Oratakuppai Village, Palladam Main Road, Coimbatore 641201",
+    "lat": 10.92335,
+    "lng": 77.054224
   },
   "DEL2": {
     "name": "Amazon FC DEL2",
     "city": "Tauru",
     "state": "Haryana",
-    "address": "MDR132, Tauru, Haryana 122015",
-    "lat": 28.2130,
-    "lng": 76.9450
+    "address": "Unit No. 1, Khewat/Khata No. 373/400, Mustatil No. 31, MDR132, Village Tauru, Nuh, Haryana 122015",
+    "lat": 28.225675,
+    "lng": 76.943817
   },
   "DEL4": {
     "name": "Amazon FC DEL4",
-    "city": "Kharkari",
+    "city": "Jamalpur",
     "state": "Haryana",
-    "address": "Jamalpur-Panchgaon Rd, Kharkari, Haryana 122503",
-    "lat": 28.3668,
-    "lng": 76.8530
+    "address": "Jamalpur-Panchgaon Road, Kharkari, Jamalpur, Gurgaon, Haryana 122503",
+    "lat": 28.366774,
+    "lng": 76.85299
   },
   "DEL5": {
     "name": "Amazon FC DEL5",
     "city": "Manesar",
     "state": "Haryana",
-    "address": "Adjacent to Starex School, Binola, NH-8, Manesar, Gurgaon 122413",
-    "lat": 28.3520,
-    "lng": 76.9180
+    "address": "Adjacent to Starex School, Binola, NH-48, Manesar, Gurgaon, Haryana 122413",
+    "lat": 28.296769,
+    "lng": 76.86523
   },
   "HYD3": {
     "name": "Amazon FC HYD3",
-    "city": "Hyderabad",
+    "city": "Shamshabad",
     "state": "Telangana",
-    "address": "Kothur, Mahbubnagar District, Telangana",
-    "lat": 17.1540,
-    "lng": 78.1120
+    "address": "Shamshabad, Hyderabad, Telangana 501218",
+    "lat": 17.237472,
+    "lng": 78.44672
   },
   "HYD8": {
     "name": "Amazon FC HYD8",
-    "city": "Hyderabad",
+    "city": "Shamshabad",
     "state": "Telangana",
-    "address": "Patancheru, Sangareddy District, Telangana",
-    "lat": 17.5280,
-    "lng": 78.2640
+    "address": "Survey No. 99/1, Mamidipally Village, Shamshabad, Hyderabad, Telangana 501218",
+    "lat": 17.238729,
+    "lng": 78.441039
   },
   "LKO1": {
     "name": "Amazon FC LKO1",
     "city": "Lucknow",
     "state": "Uttar Pradesh",
-    "address": "Malhaur, Lucknow, Uttar Pradesh",
-    "lat": 26.8900,
-    "lng": 81.0200
+    "address": "Khasra No 472 and others, Village Bhukapur, Tehsil Sarojini Nagar, Lucknow 226401",
+    "lat": 26.772,
+    "lng": 80.7386
   },
   "MAA4": {
     "name": "Amazon FC MAA4",
-    "city": "Chennai",
+    "city": "Ponneri",
     "state": "Tamil Nadu",
-    "address": "Red Hills, Chennai, Tamil Nadu",
-    "lat": 13.2100,
-    "lng": 80.1850
+    "address": "Indo Space AS Industrial Park, Survey No.139-157/2, Durainallur Village, Puduvoyal Post, Ponneri, Thiruvallur 601206",
+    "lat": 13.327498,
+    "lng": 80.134769
   },
   "MAA5": {
     "name": "Amazon FC MAA5",
     "city": "Chennai",
     "state": "Tamil Nadu",
-    "address": "Sriperumbudur, Kanchipuram District, Tamil Nadu",
-    "lat": 12.9680,
-    "lng": 79.9480
+    "address": "No. 1, Central Warehouse Corporation, 132 Arcot Road, Ayyavupuram, Virugambakkam, Chennai 600093",
+    "lat": 13.047109,
+    "lng": 80.195207
   },
   "PNQ3": {
     "name": "Amazon FC PNQ3",
     "city": "Pune",
     "state": "Maharashtra",
-    "address": "Village Ambethan, Tal-Khed, Pune 410501",
-    "lat": 18.8920,
-    "lng": 73.7820
+    "address": "Building No. B01, ESR Pune Estates Pvt Ltd, Village Ambethan, Tal-Khed, Pune 410501",
+    "lat": 18.840507,
+    "lng": 73.907187
   },
   "AMD1": {
     "name": "Amazon FC AMD1",
     "city": "Ahmedabad",
     "state": "Gujarat",
-    "address": "Sanand, Ahmedabad, Gujarat",
-    "lat": 22.9900,
-    "lng": 72.3800
+    "address": "Crystal Indus Logistics Park, Unit No.10, NH-8, Bhayla Village, Bawla Taluka, Ahmedabad 382220",
+    "lat": 22.825526,
+    "lng": 72.367487
   },
   "CCU1": {
     "name": "Amazon FC CCU1",
-    "city": "Kolkata",
+    "city": "Howrah",
     "state": "West Bengal",
-    "address": "Dankuni, Hooghly, West Bengal",
-    "lat": 22.6800,
-    "lng": 88.2900
+    "address": "ESR Warehousing Pvt Ltd, Vill Amraberia, Birshibpur, Uluberia, Howrah 711316",
+    "lat": 22.482731,
+    "lng": 88.044595
   }
 }
