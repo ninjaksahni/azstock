@@ -68,6 +68,71 @@ DEFAULT_SETTINGS = {
 }
 
 
+def normalize_settings(settings: dict) -> dict:
+    merged = {**DEFAULT_SETTINGS, **settings}
+    if merged.get("selected_cities") and merged.get("selected_warehouses"):
+        merged.pop("selected_warehouses", None)
+    return merged
+
+
+def send_plan_row_key(row: pd.Series, view_mode: str) -> tuple:
+    if view_mode == "City":
+        return (str(row["City"]), str(row["MSKU"]))
+    return (str(row["City"]), str(row["Warehouse"]), str(row["MSKU"]))
+
+
+def send_qty_store_key(source_key: str, view_mode: str) -> str:
+    return f"send_qty_store_{source_key}_{view_mode.lower()}"
+
+
+def suggested_send_qty(row: pd.Series) -> int:
+    return max(0, int(row["Threshold"]) - int(row["Current"]))
+
+
+def merge_send_qty_from_store(table: pd.DataFrame, store: dict, view_mode: str) -> pd.DataFrame:
+    if table.empty or not store:
+        return table
+    out = table.copy()
+    for idx, row in out.iterrows():
+        key = send_plan_row_key(row, view_mode)
+        if key in store:
+            out.at[idx, "Send qty"] = int(store[key])
+    return out
+
+
+def persist_send_qty_to_store(table: pd.DataFrame, store: dict, view_mode: str) -> None:
+    for _, row in table.iterrows():
+        store[send_plan_row_key(row, view_mode)] = int(row.get("Send qty") or 0)
+
+
+def export_csv_with_metadata(df: pd.DataFrame, metadata: list[str], footer: list[str] | None = None) -> bytes:
+    lines = [f"# {line}" for line in metadata]
+    body = df.to_csv(index=False)
+    if footer:
+        padded = (footer + [""] * len(df.columns))[: len(df.columns)]
+        footer_df = pd.DataFrame([dict(zip(df.columns, padded))], columns=df.columns)
+        body = body.rstrip("\n") + "\n" + footer_df.to_csv(index=False, header=False)
+    return ("\n".join(lines) + "\n" + body).encode("utf-8")
+
+
+def sync_live_filter_settings(settings: dict, agg: pd.DataFrame | None = None) -> None:
+    """Apply city/warehouse filter changes to session immediately."""
+    live = st.session_state.settings
+    new_cities = settings.get("selected_cities") or []
+    new_excluded = settings.get("excluded_warehouses") or []
+    wh_opts = set(warehouses_for_cities(new_cities, agg))
+    new_excluded = [wh for wh in new_excluded if wh in wh_opts]
+    settings["excluded_warehouses"] = new_excluded
+
+    if live.get("selected_cities") == new_cities and live.get("excluded_warehouses") == new_excluded:
+        return
+
+    live["selected_cities"] = new_cities
+    live["excluded_warehouses"] = new_excluded
+    st.session_state.settings = live
+    st.rerun()
+
+
 @st.cache_data
 def load_warehouse_locations() -> dict[str, dict]:
     with open(LOCATIONS_FILE, encoding="utf-8") as f:
@@ -78,14 +143,16 @@ def load_settings() -> dict:
     if SETTINGS_FILE.exists():
         with open(SETTINGS_FILE, encoding="utf-8") as f:
             saved = json.load(f)
-        return {**DEFAULT_SETTINGS, **saved}
+        return normalize_settings(saved)
     return DEFAULT_SETTINGS.copy()
 
 
 def save_settings(settings: dict) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    to_save = normalize_settings(settings.copy())
+    to_save.pop("selected_warehouses", None)
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(settings, f, indent=2)
+        json.dump(to_save, f, indent=2)
 
 
 def load_history() -> list[dict]:
@@ -861,6 +928,8 @@ def build_warehouse_map(
     else:
         m = folium.Map(location=[20.6, 78.9], zoom_start=4, tiles="OpenStreetMap")
 
+    map_bounds: list[list[float]] = []
+
     if mode == "All warehouses":
         for _, row in loc_totals.iterrows():
             loc = row["Location"]
@@ -925,6 +994,7 @@ def build_warehouse_map(
                 tooltip=tooltip,
                 popup=folium.Popup(popup_html, max_width=400),
             ).add_to(m)
+            map_bounds.append([lat, lng])
     else:
         filtered = loc_totals
         if selected_cities:
@@ -985,6 +1055,10 @@ def build_warehouse_map(
                 tooltip=tooltip,
                 popup=folium.Popup(popup_html, max_width=420),
             ).add_to(m)
+            map_bounds.append([lat, lng])
+
+    if map_bounds:
+        m.fit_bounds(map_bounds, padding=(40, 40))
 
     return m, unmapped
 
@@ -1006,6 +1080,7 @@ def render_settings_panel(settings: dict, agg: pd.DataFrame | None = None) -> di
 
     st.divider()
     st.subheader("🏙️ Cities")
+    st.caption("Filters apply immediately. **Save settings** persists across restarts.")
     city_options = all_city_options(agg)
     saved_cities = settings.get("selected_cities")
     if saved_cities is None and settings.get("selected_warehouses"):
@@ -1017,9 +1092,10 @@ def render_settings_panel(settings: dict, agg: pd.DataFrame | None = None) -> di
         options=city_options,
         default=default_cities,
         format_func=lambda code: f"{city_display_name(code)} ({code})",
-        help="All warehouses in a selected city are included. Save settings to apply.",
+        help="All warehouses in a selected city are included.",
         key="settings_selected_cities",
     )
+    sync_live_filter_settings(settings, agg)
     if settings["selected_cities"]:
         enabled_wh = effective_warehouses(settings, agg)
         excluded = excluded_warehouses(settings)
@@ -1031,7 +1107,7 @@ def render_settings_panel(settings: dict, agg: pd.DataFrame | None = None) -> di
         else:
             st.caption(f"**{len(enabled_wh)}** warehouses enabled: {', '.join(enabled_wh)}")
     else:
-        st.warning("Select at least one city, then click **Save settings**.")
+        st.warning("Select at least one city.")
 
     st.divider()
     st.subheader("🏭 Warehouses")
@@ -1046,6 +1122,7 @@ def render_settings_panel(settings: dict, agg: pd.DataFrame | None = None) -> di
         help="These FCs are omitted from Send Plan, Overview, and Map.",
         key="settings_excluded_warehouses",
     )
+    sync_live_filter_settings(settings, agg)
 
     if agg is not None:
         st.divider()
@@ -1095,9 +1172,10 @@ def render_settings_panel(settings: dict, agg: pd.DataFrame | None = None) -> di
             settings["excluded_warehouses"] = [
                 wh for wh in (settings.get("excluded_warehouses") or []) if wh in wh_opts
             ]
+            settings = normalize_settings(settings)
             st.session_state.settings = settings
             save_settings(settings)
-            st.success("Settings saved.")
+            st.success("Settings saved to disk.")
     with sc2:
         if st.button("Reset to defaults"):
             settings = DEFAULT_SETTINGS.copy()
@@ -1120,7 +1198,10 @@ def render_history_panel() -> None:
     for snap in history:
         summary = snap.get("summary", {})
         is_active = snap["id"] == active_id
+        ledger = snapshot_ledger_data_date(snap)
         label = f"{'▶ ' if is_active else ''}{snap['uploaded_at']}"
+        if ledger:
+            label += f" · Ledger: {ledger}"
         detail = (
             f"{summary.get('total_sellable', '?')} units · "
             f"{summary.get('warehouses', '?')} warehouses · "
@@ -1163,15 +1244,21 @@ def prepare_send_plan_table(
 
     if view_mode == "City":
         view = aggregate_send_plan_by_city(view)
-        display_cols = ["Priority", "City", "MSKU", "Current", "Threshold", "Send qty"]
+        display_cols = ["Priority", "City", "MSKU", "Current", "Threshold", "Suggested", "Send qty"]
     else:
-        display_cols = ["Priority", "City", "Warehouse", "MSKU", "Current", "Threshold", "Send qty"]
+        display_cols = [
+            "Priority", "City", "Warehouse", "MSKU", "Current", "Threshold", "Suggested", "Send qty"
+        ]
 
     if not show_all:
         view = view[view.apply(lambda r: send_plan_includes_row(r, view_mode), axis=1)]
 
     if view.empty:
         return view, display_cols
+
+    view["Suggested"] = view.apply(suggested_send_qty, axis=1)
+    if "Send qty" not in view.columns:
+        view["Send qty"] = 0
 
     if sort_by not in display_cols:
         sort_by = "Priority"
@@ -1180,7 +1267,11 @@ def prepare_send_plan_table(
     return view[display_cols].copy(), display_cols
 
 
-def render_send_plan_tab(plan: pd.DataFrame, source_key: str) -> None:
+def render_send_plan_tab(
+    plan: pd.DataFrame,
+    source_key: str,
+    ledger_data_date: str | None = None,
+) -> None:
     st.subheader("📋 Send Plan")
     st.caption("Review low-stock lines and enter how many units you plan to send. Export matches the table row order below.")
 
@@ -1203,16 +1294,22 @@ def render_send_plan_tab(plan: pd.DataFrame, source_key: str) -> None:
             key=f"send_plan_view_{source_key}",
         )
     with fc3:
-        show_all = st.checkbox("Show all SKUs (including above threshold)", value=False)
+        show_all = st.checkbox(
+            "Show all SKUs (including above threshold)",
+            value=False,
+            key=f"pref_send_plan_show_all_{source_key}",
+        )
 
     if not selected_skus:
         st.warning("Select at least one MSKU to include in the send plan.")
         return
 
     display_cols = (
-        ["Priority", "City", "MSKU", "Current", "Threshold", "Send qty"]
+        ["Priority", "City", "MSKU", "Current", "Threshold", "Suggested", "Send qty"]
         if view_mode == "City"
-        else ["Priority", "City", "Warehouse", "MSKU", "Current", "Threshold", "Send qty"]
+        else [
+            "Priority", "City", "Warehouse", "MSKU", "Current", "Threshold", "Suggested", "Send qty"
+        ]
     )
     sc1, sc2 = st.columns([2, 1])
     with sc1:
@@ -1236,15 +1333,32 @@ def render_send_plan_tab(plan: pd.DataFrame, source_key: str) -> None:
         st.info("No rows match your filters.")
         return
 
-    data_key = f"send_plan_table_{view_mode.lower()}_{source_key}"
-    meta_key = f"{data_key}_meta"
-    editor_key = f"send_plan_editor_{view_mode.lower()}_{source_key}"
-    table_meta = (view_mode, tuple(sorted(selected_skus)), show_all, sort_by, sort_asc)
+    store_key = send_qty_store_key(source_key, view_mode)
+    qty_store: dict = st.session_state.setdefault(store_key, {})
+    table = merge_send_qty_from_store(table, qty_store, view_mode)
 
-    if st.session_state.get(meta_key) != table_meta:
-        st.session_state[data_key] = table
-        st.session_state[meta_key] = table_meta
-        st.session_state.pop(editor_key, None)
+    editor_key = f"send_plan_editor_{view_mode.lower()}_{source_key}"
+    fill1, fill2, fill3, _ = st.columns([1, 1, 1, 2])
+    with fill1:
+        if st.button("Fill send qty with gap", key=f"send_fill_gap_{view_mode}_{source_key}"):
+            for _, row in table.iterrows():
+                qty_store[send_plan_row_key(row, view_mode)] = suggested_send_qty(row)
+            st.session_state[store_key] = qty_store
+            st.session_state.pop(editor_key, None)
+            st.rerun()
+    with fill2:
+        if st.button("Fill zeros only", key=f"send_fill_zero_{view_mode}_{source_key}"):
+            for _, row in table.iterrows():
+                if int(row["Current"]) == 0:
+                    qty_store[send_plan_row_key(row, view_mode)] = suggested_send_qty(row)
+            st.session_state[store_key] = qty_store
+            st.session_state.pop(editor_key, None)
+            st.rerun()
+    with fill3:
+        if st.button("Clear send quantities", key=f"send_clear_{view_mode}_{source_key}"):
+            st.session_state[store_key] = {}
+            st.session_state.pop(editor_key, None)
+            st.rerun()
 
     column_config = {
         "Priority": st.column_config.NumberColumn("Priority", disabled=True),
@@ -1252,23 +1366,44 @@ def render_send_plan_tab(plan: pd.DataFrame, source_key: str) -> None:
         "MSKU": st.column_config.TextColumn("MSKU", disabled=True),
         "Current": st.column_config.NumberColumn("Current", disabled=True),
         "Threshold": st.column_config.NumberColumn("Threshold", disabled=True),
+        "Suggested": st.column_config.NumberColumn("Suggested", disabled=True),
         "Send qty": st.column_config.NumberColumn("Send qty", min_value=0, step=1),
     }
     if view_mode == "Warehouse":
         column_config["Warehouse"] = st.column_config.TextColumn("Warehouse", disabled=True)
 
     edited = st.data_editor(
-        st.session_state[data_key],
+        table,
         column_config=column_config,
         hide_index=True,
         use_container_width=True,
         key=editor_key,
     )
+    persist_send_qty_to_store(edited, qty_store, view_mode)
+    st.session_state[store_key] = qty_store
 
+    total_send = int(edited["Send qty"].fillna(0).sum())
+    st.caption(f"**Total send qty:** {total_send:,} units")
+
+    export_meta = [
+        f"Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"View: {view_mode}",
+        f"SKUs: {', '.join(selected_skus)}",
+    ]
+    if ledger_data_date:
+        export_meta.append(f"Ledger data date: {ledger_data_date}")
+    footer = ["TOTAL", "", "", "", "", "", str(total_send)] if view_mode == "City" else [
+        "TOTAL", "", "", "", "", "", "", str(total_send)
+    ]
+    while len(footer) < len(display_cols):
+        footer.insert(-1, "")
+    footer = footer[: len(display_cols)]
+
+    date_slug = ledger_data_date.replace(" ", "_") if ledger_data_date else datetime.now().strftime("%Y%m%d")
     st.download_button(
         label="⬇️ Export send plan CSV",
-        data=edited[display_cols].to_csv(index=False).encode("utf-8"),
-        file_name=f"send_plan_{view_mode.lower()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        data=export_csv_with_metadata(edited[display_cols], export_meta, footer=footer),
+        file_name=f"send_plan_{view_mode.lower()}_{date_slug}.csv",
         mime="text/csv",
     )
 
@@ -1351,6 +1486,19 @@ def render_overview_tab(
             st.info("No alerts match your filters.")
         elif alert_group == "Flat list":
             st.dataframe(alerts_df, use_container_width=True, hide_index=True)
+            st.download_button(
+                "⬇️ Export alerts CSV",
+                data=export_csv_with_metadata(
+                    alerts_df,
+                    [
+                        f"Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                        "Section: Low stock alerts",
+                    ],
+                ),
+                file_name=f"alerts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                key=f"export_alerts_{source_key}",
+            )
         elif alert_group == "City":
             for city_code in sorted(alerts_df["City"].unique()):
                 city_rows = alerts_df[alerts_df["City"] == city_code]
@@ -1424,10 +1572,39 @@ def render_overview_tab(
 
     st.download_button(
         "⬇️ Download aggregated CSV",
-        data=filtered_agg.to_csv(index=False).encode("utf-8"),
+        data=export_csv_with_metadata(
+            filtered_agg,
+            [f"Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", "Section: Aggregated sellable by location"],
+        ),
         file_name="aggregated_sellable_by_location_msku.csv",
         mime="text/csv",
     )
+
+
+def render_sidebar_context(
+    source_label: str,
+    settings: dict,
+    agg: pd.DataFrame | None,
+    recorded_date: str | None,
+    ledger_data_date: str | None,
+) -> None:
+    st.divider()
+    st.caption("At a glance")
+    st.markdown(f"**Source:** {source_label}")
+    if recorded_date:
+        st.markdown(f"**Recorded:** {recorded_date}")
+    if ledger_data_date:
+        st.markdown(f"**Ledger date:** {ledger_data_date}")
+    cities = effective_selected_cities(settings, agg)
+    enabled = effective_warehouses(settings, agg)
+    excluded = excluded_warehouses(settings)
+    st.markdown(f"**Cities enabled:** {len(cities)}")
+    st.markdown(f"**Warehouses enabled:** {len(enabled)}")
+    if excluded:
+        st.markdown(f"**Excluded FCs:** {len(excluded)}")
+    if st.button("Open settings", key="sidebar_open_settings"):
+        st.session_state.jump_to_settings = True
+        st.rerun()
 
 
 def render_map_tab(agg: pd.DataFrame, settings: dict, alerts_data: dict) -> None:
@@ -1438,7 +1615,12 @@ def render_map_tab(agg: pd.DataFrame, settings: dict, alerts_data: dict) -> None
 
     mc1, mc2, mc3 = st.columns([1, 2, 1])
     with mc1:
-        map_mode = st.radio("View", ["By city", "All warehouses"], horizontal=True, index=0)
+        map_mode = st.radio(
+            "View",
+            ["By city", "All warehouses"],
+            horizontal=True,
+            key="pref_map_mode",
+        )
     with mc2:
         selected_cities = st.multiselect(
             "Cities",
@@ -1446,17 +1628,18 @@ def render_map_tab(agg: pd.DataFrame, settings: dict, alerts_data: dict) -> None
             default=city_options,
             format_func=lambda c: f"{city_labels[c]} ({c})",
             help="Limited to cities enabled in History & Settings.",
+            key="pref_map_cities",
         )
     with mc3:
-        show_low_only = st.checkbox("Low stock only", value=True)
+        show_low_only = st.checkbox("Low stock only", value=True, key="pref_map_low_stock_only")
 
     opt1, opt2 = st.columns(2)
     with opt1:
-        satellite_view = st.checkbox("Satellite view", value=False)
+        satellite_view = st.checkbox("Satellite view", value=False, key="pref_satellite_view")
     with opt2:
         show_lis_radius = False
         if map_mode == "All warehouses":
-            show_lis_radius = st.checkbox("SHOW LIS RADIUS", value=False)
+            show_lis_radius = st.checkbox("SHOW LIS RADIUS", value=False, key="pref_show_lis_radius")
 
     warehouse_map, unmapped = build_warehouse_map(
         agg,
@@ -1470,10 +1653,15 @@ def render_map_tab(agg: pd.DataFrame, settings: dict, alerts_data: dict) -> None
         satellite_view=satellite_view,
         settings=settings,
     )
+    excluded = excluded_warehouses(settings)
+    if excluded:
+        st.caption(f"Excluded from map: {', '.join(sorted(excluded))}")
     if unmapped:
-        st.warning(f"Unmapped warehouses: {', '.join(unmapped)}")
+        st.warning(f"Unmapped warehouses (no coordinates): {', '.join(unmapped)}")
     if selected_cities:
         st_folium(warehouse_map, width="100%", height=750, returned_objects=[])
+    elif not selected_cities:
+        st.info("Select at least one city to display the map.")
 
 
 def render_data_dates_banner(
@@ -1505,6 +1693,12 @@ def render_app(
     recorded_date: str | None = None,
     ledger_data_date: str | None = None,
 ) -> None:
+    with st.sidebar:
+        render_sidebar_context(source_label, settings, agg, recorded_date, ledger_data_date)
+
+    if st.session_state.pop("jump_to_settings", False):
+        st.info("Open the **History & Settings** tab below to change city and warehouse filters.")
+
     render_data_dates_banner(recorded_date, ledger_data_date)
 
     st.caption(f"Data source: **{source_label}**")
@@ -1513,7 +1707,19 @@ def render_app(
     settings["scope"] = "per_city"
     agg, city_agg = apply_city_filter(agg, city_agg, settings)
     if agg.empty:
-        st.warning("No data for the cities selected in **History & Settings**. Select at least one city and save.")
+        cities = effective_selected_cities(settings, agg)
+        enabled = effective_warehouses(settings, agg)
+        excluded = excluded_warehouses(settings)
+        st.warning("No data for the current city and warehouse filters.")
+        st.markdown(
+            f"**Cities enabled:** {', '.join(cities) or 'none'}  \n"
+            f"**Warehouses enabled:** {', '.join(enabled) or 'none'}"
+        )
+        if excluded:
+            st.markdown(f"**Excluded FCs:** {', '.join(sorted(excluded))}")
+        if st.button("Open settings", key="empty_open_settings"):
+            st.session_state.jump_to_settings = True
+            st.rerun()
         tab_history = st.tabs(["⚙️ History & Settings"])[0]
         with tab_history:
             render_history_panel()
@@ -1531,7 +1737,7 @@ def render_app(
     )
 
     with tab_send:
-        render_send_plan_tab(send_plan, source_key)
+        render_send_plan_tab(send_plan, source_key, ledger_data_date)
 
     with tab_overview:
         render_overview_tab(agg, city_agg, velocity, settings, send_plan, source_key)
@@ -1621,32 +1827,57 @@ if uploaded_file is not None and not st.session_state.get("prefer_history"):
         st.session_state.save_decision_for = None
         st.session_state.prefer_history = False
     try:
-        df = _read_csv_safe(uploaded_file)
-        ledger_data_date = extract_ledger_data_date(df)
-        agg, city_agg, velocity = parse_ledger_csv(df)
+        with st.spinner("Parsing ledger…"):
+            df = _read_csv_safe(uploaded_file)
+            ledger_data_date = extract_ledger_data_date(df)
+            agg, city_agg, velocity = parse_ledger_csv(df)
         source_label = f"Upload · {uploaded_file.name}"
     except Exception as e:
         st.error(str(e))
+        if "missing required columns" in str(e).lower():
+            st.info(
+                "Download the report from "
+                "[Seller Central Ledger](https://sellercentral.amazon.in/reportcentral/LEDGER_REPORT/1) "
+                "and ensure it includes MSKU, Disposition, Ending Warehouse Balance, and Location columns."
+            )
         st.stop()
 
+    save_pref = st.session_state.get("upload_save_pref")
     if st.session_state.get("save_decision_for") != upload_sig:
-        st.info("Save this upload to history?")
-        sc1, sc2 = st.columns(2)
-        with sc1:
-            if st.button("✅ Yes, save to history", type="primary"):
-                snap = append_snapshot(agg, ledger_data_date)
-                st.session_state.active_snapshot_id = snap["id"]
-                st.session_state.save_decision_for = upload_sig
-                st.session_state.prefer_history = False
-                source_key = snap["id"]
-                st.success(f"Saved snapshot from {snap['uploaded_at']}")
-                st.rerun()
-        with sc2:
-            if st.button("Skip — use without saving"):
-                st.session_state.save_decision_for = upload_sig
-                st.session_state.active_snapshot_id = None
-                st.session_state.prefer_history = False
-                st.rerun()
+        if save_pref == "always":
+            snap = append_snapshot(agg, ledger_data_date)
+            st.session_state.active_snapshot_id = snap["id"]
+            st.session_state.save_decision_for = upload_sig
+            st.session_state.prefer_history = False
+            source_key = snap["id"]
+        elif save_pref == "never":
+            st.session_state.save_decision_for = upload_sig
+            st.session_state.active_snapshot_id = None
+            st.session_state.prefer_history = False
+        else:
+            st.info("Save this upload to history?")
+            remember = st.checkbox("Remember my choice", key=f"remember_save_{upload_sig}")
+            sc1, sc2 = st.columns(2)
+            with sc1:
+                if st.button("✅ Yes, save to history", type="primary"):
+                    if remember:
+                        st.session_state.upload_save_pref = "always"
+                    snap = append_snapshot(agg, ledger_data_date)
+                    st.session_state.active_snapshot_id = snap["id"]
+                    st.session_state.save_decision_for = upload_sig
+                    st.session_state.prefer_history = False
+                    source_key = snap["id"]
+                    st.success(f"Saved snapshot from {snap['uploaded_at']}")
+                    st.rerun()
+            with sc2:
+                if st.button("Skip — use without saving"):
+                    if remember:
+                        st.session_state.upload_save_pref = "never"
+                    st.session_state.save_decision_for = upload_sig
+                    st.session_state.active_snapshot_id = None
+                    st.session_state.prefer_history = False
+                    st.rerun()
+            st.stop()
 
     recorded_date = None
     if st.session_state.get("save_decision_for") == upload_sig:
