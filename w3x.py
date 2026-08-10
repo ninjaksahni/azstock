@@ -73,7 +73,7 @@ def save_history(history: list[dict]) -> None:
         json.dump(history, f, indent=2)
 
 
-def make_snapshot(agg: pd.DataFrame) -> dict:
+def make_snapshot(agg: pd.DataFrame, ledger_data_date: str | None = None) -> dict:
     now = datetime.now()
     records = []
     has_transit = "In Transit Between Warehouses" in agg.columns
@@ -91,6 +91,7 @@ def make_snapshot(agg: pd.DataFrame) -> dict:
     return {
         "id": now.strftime("%Y%m%d_%H%M%S"),
         "uploaded_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "ledger_data_date": ledger_data_date,
         "records": records,
         "summary": {
             "warehouses": int(agg["Location"].nunique()),
@@ -101,8 +102,8 @@ def make_snapshot(agg: pd.DataFrame) -> dict:
     }
 
 
-def append_snapshot(agg: pd.DataFrame) -> dict:
-    snapshot = make_snapshot(agg)
+def append_snapshot(agg: pd.DataFrame, ledger_data_date: str | None = None) -> dict:
+    snapshot = make_snapshot(agg, ledger_data_date)
     history = load_history()
     history.insert(0, snapshot)
     save_history(history)
@@ -223,6 +224,36 @@ def _read_csv_safe(uploaded_file):
 def _find_col(df, name):
     mapping = {c.strip().lower(): c for c in df.columns}
     return mapping.get(name.strip().lower())
+
+
+def format_data_date(value) -> str | None:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    text = str(value).strip()
+    parsed = pd.to_datetime(text, errors="coerce")
+    if pd.isna(parsed):
+        parsed = pd.to_datetime(text, dayfirst=True, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return f"{int(parsed.day)} {parsed.strftime('%B').upper()} {parsed.year}"
+
+
+def extract_ledger_data_date(df: pd.DataFrame) -> str | None:
+    date_col = _find_col(df, "Date")
+    if not date_col:
+        return None
+    dates = pd.to_datetime(df[date_col], dayfirst=True, errors="coerce")
+    if dates.isna().all():
+        return None
+    return format_data_date(dates.max())
+
+
+def snapshot_recorded_date(snapshot: dict) -> str | None:
+    return format_data_date(snapshot.get("uploaded_at"))
+
+
+def snapshot_ledger_data_date(snapshot: dict) -> str | None:
+    return snapshot.get("ledger_data_date")
 
 
 def chunks(lst, n):
@@ -1086,6 +1117,25 @@ def render_map_tab(agg: pd.DataFrame, settings: dict, alerts_data: dict) -> None
         st_folium(warehouse_map, width="100%", height=750, returned_objects=[])
 
 
+def render_data_dates_banner(
+    recorded_date: str | None,
+    ledger_data_date: str | None,
+) -> None:
+    parts: list[str] = []
+    if recorded_date:
+        parts.append(f"Data recorded: <strong>{recorded_date}</strong>")
+    if ledger_data_date:
+        parts.append(f"DATA DATE: <strong>{ledger_data_date}</strong>")
+    if not parts:
+        return
+    st.markdown(
+        f"<div style='background:#1f2937;color:#fff;padding:14px 18px;border-radius:8px;"
+        f"font-size:1.25rem;margin:0 0 16px 0;'>"
+        f"📅 {' &nbsp;|&nbsp; '.join(parts)}</div>",
+        unsafe_allow_html=True,
+    )
+
+
 def render_app(
     agg: pd.DataFrame,
     city_agg: pd.DataFrame,
@@ -1093,7 +1143,11 @@ def render_app(
     settings: dict,
     source_label: str,
     source_key: str,
+    recorded_date: str | None = None,
+    ledger_data_date: str | None = None,
 ) -> None:
+    render_data_dates_banner(recorded_date, ledger_data_date)
+
     st.caption(f"Data source: **{source_label}**")
 
     settings = st.session_state.settings
@@ -1175,7 +1229,13 @@ settings = st.session_state.settings
 
 st.title("📦 Amazon Warehouse Stock")
 st.markdown(
-    "Upload your Ledger CSV to see **what stock to send to which city** based on your thresholds."
+    "Download your **Ledger Report** from "
+    "[Seller Central](https://sellercentral.amazon.in/reportcentral/LEDGER_REPORT/1) "
+    "and upload the CSV here to see **what stock to send to which city** based on your thresholds."
+)
+st.markdown(
+    "**Date range:** choose **exact dates** only — the **last 2 days, excluding today** "
+    "(yesterday and the day before)."
 )
 
 uploaded_file = st.file_uploader("📤 Upload Ledger CSV", type=["csv"])
@@ -1193,6 +1253,7 @@ if uploaded_file is not None and not st.session_state.get("prefer_history"):
         st.session_state.prefer_history = False
     try:
         df = _read_csv_safe(uploaded_file)
+        ledger_data_date = extract_ledger_data_date(df)
         agg, city_agg, velocity = parse_ledger_csv(df)
         source_label = f"Upload · {uploaded_file.name}"
     except Exception as e:
@@ -1204,7 +1265,7 @@ if uploaded_file is not None and not st.session_state.get("prefer_history"):
         sc1, sc2 = st.columns(2)
         with sc1:
             if st.button("✅ Yes, save to history", type="primary"):
-                snap = append_snapshot(agg)
+                snap = append_snapshot(agg, ledger_data_date)
                 st.session_state.active_snapshot_id = snap["id"]
                 st.session_state.save_decision_for = upload_sig
                 st.session_state.prefer_history = False
@@ -1218,7 +1279,16 @@ if uploaded_file is not None and not st.session_state.get("prefer_history"):
                 st.session_state.prefer_history = False
                 st.rerun()
 
-    render_app(agg, city_agg, velocity, settings, source_label, source_key)
+    recorded_date = None
+    if st.session_state.get("save_decision_for") == upload_sig:
+        saved = get_snapshot(st.session_state.get("active_snapshot_id", ""))
+        if saved:
+            recorded_date = snapshot_recorded_date(saved)
+            ledger_data_date = snapshot_ledger_data_date(saved) or ledger_data_date
+
+    render_app(
+        agg, city_agg, velocity, settings, source_label, source_key, recorded_date, ledger_data_date
+    )
 
 else:
     snap = None
@@ -1237,6 +1307,10 @@ else:
         velocity = None
         source_label = f"History · {snap['uploaded_at']}"
         source_key = snap["id"]
-        render_app(agg, city_agg, velocity, settings, source_label, source_key)
+        recorded_date = snapshot_recorded_date(snap)
+        ledger_data_date = snapshot_ledger_data_date(snap)
+        render_app(
+            agg, city_agg, velocity, settings, source_label, source_key, recorded_date, ledger_data_date
+        )
     else:
         st.info("Upload a CSV to get started. Saved snapshots appear under **History & Settings**.")
