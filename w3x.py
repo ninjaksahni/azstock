@@ -454,6 +454,7 @@ def build_send_plan(agg: pd.DataFrame, settings: dict) -> pd.DataFrame:
                 "Shortfall %": round(shortfall_pct, 1),
                 "Send qty": 0,
                 "_low": current <= threshold,
+                "_zero": current == 0,
             }
         )
 
@@ -492,6 +493,14 @@ def aggregate_send_plan_by_city(plan: pd.DataFrame) -> pd.DataFrame:
     return grouped
 
 
+def send_plan_includes_row(row: pd.Series, view_mode: str) -> bool:
+    if view_mode == "City":
+        return bool(row.get("_low", False))
+    if bool(row.get("_zero", False)):
+        return True
+    return bool(row.get("_low", False))
+
+
 def send_plan_summary(plan: pd.DataFrame) -> dict:
     if plan.empty:
         return {"cities": 0, "skus": 0, "units_short": 0, "warehouses": 0}
@@ -501,6 +510,46 @@ def send_plan_summary(plan: pd.DataFrame) -> dict:
         "warehouses": int(low["Warehouse"].nunique()) if not low.empty else 0,
         "skus": len(low),
         "units_short": int(low["Shortfall"].sum()) if not low.empty else 0,
+    }
+
+
+def overview_low_stock_table(plan: pd.DataFrame, zero_only: bool = False) -> pd.DataFrame:
+    if plan.empty:
+        return plan.copy()
+    view = plan[plan["_low"]].copy()
+    if zero_only:
+        view = view[view["Current"] == 0]
+    if view.empty:
+        return view
+    view["Status"] = view["Current"].apply(lambda q: "ZERO" if q == 0 else "LOW")
+    return view[
+        ["City", "Warehouse", "MSKU", "Current", "Threshold", "Status"]
+    ].sort_values(["Current", "Threshold"], ascending=[True, False]).reset_index(drop=True)
+
+
+def overview_warehouse_table(plan: pd.DataFrame) -> pd.DataFrame:
+    if plan.empty:
+        return plan.copy()
+    view = plan.copy()
+    view["Status"] = view.apply(
+        lambda r: "ZERO" if r["Current"] == 0 else ("LOW" if r["_low"] else "OK"),
+        axis=1,
+    )
+    return view[
+        ["Warehouse", "City", "MSKU", "Current", "Threshold", "Status"]
+    ].sort_values(["Status", "Current"], ascending=[True, True]).reset_index(drop=True)
+
+
+def city_overview_metrics(city_code: str, send_plan: pd.DataFrame, city_agg: pd.DataFrame) -> dict:
+    city_stock = int(
+        city_agg.loc[city_agg["CityCode"] == city_code, "Ending Warehouse Balance"].sum()
+    )
+    city_plan = send_plan[send_plan["CityCode"] == city_code]
+    low = city_plan[city_plan["_low"]] if not city_plan.empty else city_plan
+    return {
+        "total_stock": city_stock,
+        "low_lines": len(low),
+        "warehouses": int(city_plan["Warehouse"].nunique()) if not city_plan.empty else 0,
     }
 
 
@@ -885,8 +934,7 @@ def render_summary_banner(plan: pd.DataFrame) -> None:
         st.warning(
             f"**{summary['cities']}** cities · "
             f"**{summary['warehouses']}** warehouses · "
-            f"**{summary['skus']}** lines below threshold · "
-            f"**{summary['units_short']}** units short"
+            f"**{summary['skus']}** lines below threshold"
         )
 
 
@@ -898,8 +946,7 @@ def prepare_send_plan_table(
     sort_by: str,
     sort_asc: bool,
 ) -> tuple[pd.DataFrame, list[str]]:
-    view = plan.drop(columns=["_low"], errors="ignore")
-    view = view[view["MSKU"].astype(str).isin(selected_skus)]
+    view = plan[plan["MSKU"].astype(str).isin(selected_skus)].copy()
 
     if view_mode == "City":
         view = aggregate_send_plan_by_city(view)
@@ -908,7 +955,7 @@ def prepare_send_plan_table(
         display_cols = ["Priority", "City", "Warehouse", "MSKU", "Current", "Threshold", "Send qty"]
 
     if not show_all:
-        view = view[view["Shortfall"] > 0]
+        view = view[view.apply(lambda r: send_plan_includes_row(r, view_mode), axis=1)]
 
     if view.empty:
         return view, display_cols
@@ -922,7 +969,7 @@ def prepare_send_plan_table(
 
 def render_send_plan_tab(plan: pd.DataFrame, source_key: str) -> None:
     st.subheader("📋 Send Plan")
-    st.caption("Review shortages and enter how many units you plan to send. Export matches the table row order below.")
+    st.caption("Review low-stock lines and enter how many units you plan to send. Export matches the table row order below.")
 
     all_skus = sorted(plan["MSKU"].astype(str).unique())
     fc1, fc2, fc3 = st.columns([2, 1, 1])
@@ -1018,66 +1065,153 @@ def render_overview_tab(
     city_agg: pd.DataFrame,
     velocity: pd.DataFrame | None,
     settings: dict,
-    alerts_data: dict,
+    send_plan: pd.DataFrame,
+    source_key: str,
 ) -> None:
-    scope = "per_city"
-    location_totals = agg.groupby("Location")["Ending Warehouse Balance"].sum()
-    total_in_transit = (
-        int(agg["In Transit Between Warehouses"].sum())
-        if "In Transit Between Warehouses" in agg.columns
-        else 0
+    all_skus = sorted(send_plan["MSKU"].astype(str).unique()) if not send_plan.empty else []
+    selected_skus = st.multiselect(
+        "SKUs to include",
+        options=all_skus,
+        default=all_skus,
+        help="Exclude SKUs you don't want shown in this overview.",
+        key=f"overview_skus_{source_key}",
+    )
+    if not selected_skus:
+        st.warning("Select at least one MSKU to include in the overview.")
+        return
+
+    sku_filter = send_plan["MSKU"].astype(str).isin(selected_skus)
+    plan = send_plan[sku_filter].copy()
+    filtered_agg = agg[agg["MSKU"].astype(str).isin(selected_skus)].copy()
+    filtered_city_agg = city_agg[city_agg["MSKU"].astype(str).isin(selected_skus)].copy()
+    filtered_velocity = (
+        velocity[velocity["MSKU"].astype(str).isin(selected_skus)].copy()
+        if velocity is not None and not velocity.empty
+        else velocity
     )
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Warehouses", agg["Location"].nunique())
-    c2.metric("Unique MSKUs", agg["MSKU"].nunique())
-    c3.metric("Total Sellable", int(agg["Ending Warehouse Balance"].sum()))
-    c4.metric("In Transit", total_in_transit)
+    total_in_transit = (
+        int(filtered_agg["In Transit Between Warehouses"].sum())
+        if "In Transit Between Warehouses" in filtered_agg.columns
+        else 0
+    )
+    total_cities = int(filtered_city_agg["CityCode"].nunique()) if not filtered_city_agg.empty else 0
+    total_warehouses = int(filtered_agg["Location"].nunique()) if not filtered_agg.empty else 0
+    total_sellable = int(filtered_agg["Ending Warehouse Balance"].sum()) if not filtered_agg.empty else 0
+    summary = send_plan_summary(plan)
+    flagged_cities = (
+        set(plan.loc[plan["_low"], "CityCode"].unique()) if not plan.empty and "_low" in plan.columns else set()
+    )
 
-    if settings.get("enabled") and alerts_data["alerts"]:
-        st.subheader(f"⚠️ Low Stock Alerts ({len(alerts_data['alerts'])})")
-        st.dataframe(pd.DataFrame(alerts_data["alerts"]), use_container_width=True, hide_index=True)
+    st.subheader("📊 Stock health")
+    if settings.get("enabled") and summary["skus"] > 0:
+        st.warning(
+            f"**{summary['cities']}** of **{total_cities}** cities · "
+            f"**{summary['warehouses']}** of **{total_warehouses}** warehouses · "
+            f"**{summary['skus']}** low-stock lines"
+        )
+    else:
+        st.success("All warehouse × MSKU lines are above threshold.")
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Total sellable", total_sellable)
+    k2.metric("In transit", total_in_transit)
+    k3.metric("Cities flagged", summary["cities"])
+    k4.metric("Warehouses flagged", summary["warehouses"])
+    k5.metric("Low-stock lines", summary["skus"])
+
+    if settings.get("enabled") and not plan.empty:
+        st.subheader("⚠️ Low stock alerts")
+        fc1, fc2 = st.columns([2, 1])
+        with fc1:
+            alert_group = st.radio(
+                "Group by",
+                ["Flat list", "City", "Warehouse"],
+                horizontal=True,
+                key=f"overview_alert_group_{source_key}",
+            )
+        with fc2:
+            zero_only = st.checkbox("Zero stock only", value=False, key=f"overview_zero_only_{source_key}")
+
+        alerts_df = overview_low_stock_table(plan, zero_only=zero_only)
+        if alerts_df.empty:
+            st.info("No alerts match your filters.")
+        elif alert_group == "Flat list":
+            st.dataframe(alerts_df, use_container_width=True, hide_index=True)
+        elif alert_group == "City":
+            for city_code in sorted(alerts_df["City"].unique()):
+                city_rows = alerts_df[alerts_df["City"] == city_code]
+                with st.expander(f"{city_rows.iloc[0]['City']} — {len(city_rows)} alerts", expanded=False):
+                    st.dataframe(city_rows.drop(columns=["City"]), use_container_width=True, hide_index=True)
+        else:
+            for wh in sorted(alerts_df["Warehouse"].unique()):
+                wh_rows = alerts_df[alerts_df["Warehouse"] == wh]
+                with st.expander(f"{wh} — {len(wh_rows)} alerts", expanded=False):
+                    st.dataframe(wh_rows, use_container_width=True, hide_index=True)
 
     st.subheader("🏙️ Stock by city")
-    city_order = city_agg.groupby("CityCode")["Ending Warehouse Balance"].sum().sort_values(ascending=False)
-    flagged_cities = set(alerts_data["flagged_cities"])
-    sorted_cities = list(flagged_cities) + [c for c in city_order.index if c not in flagged_cities]
+    if filtered_city_agg.empty:
+        st.info("No city stock for the selected SKUs.")
+    else:
+        city_order = (
+            filtered_city_agg.groupby("CityCode")["Ending Warehouse Balance"]
+            .sum()
+            .sort_values(ascending=False)
+        )
+        sorted_cities = list(flagged_cities) + [c for c in city_order.index if c not in flagged_cities]
+        city_plan = aggregate_send_plan_by_city(plan) if not plan.empty else plan
 
-    for city_chunk in chunks(sorted_cities, 3):
-        cols = st.columns(3)
-        for i, city_code in enumerate(city_chunk):
-            with cols[i]:
-                cdf = city_agg[city_agg["CityCode"] == city_code].sort_values(
-                    "Ending Warehouse Balance", ascending=False
-                )
-                city_total = int(cdf["Ending Warehouse Balance"].sum())
-                city_warn = " ⚠️" if city_code in flagged_cities else ""
-                st.markdown(f"### {city_display_name(city_code)}{city_warn}")
-                st.caption(f"**{city_total}** units sellable")
-                for _, row in cdf.iterrows():
-                    flagged = is_sku_flagged_in_city(city_code, row["MSKU"], scope, alerts_data, agg)
-                    icon = "⚠️" if flagged else "📦"
-                    st.markdown(f"{icon} **{row['MSKU']}** — {int(row['Ending Warehouse Balance'])}")
+        for city_chunk in chunks(sorted_cities, 3):
+            cols = st.columns(3)
+            for i, city_code in enumerate(city_chunk):
+                with cols[i]:
+                    metrics = city_overview_metrics(city_code, plan, filtered_city_agg)
+                    city_warn = " ⚠️" if city_code in flagged_cities else ""
+                    label = (
+                        f"{city_display_name(city_code)}{city_warn} — "
+                        f"{metrics['total_stock']} units · "
+                        f"{metrics['low_lines']} low"
+                    )
+                    with st.expander(label, expanded=city_code in flagged_cities):
+                        if not city_plan.empty:
+                            cp = city_plan[city_plan["CityCode"] == city_code].copy()
+                            cp["Status"] = cp.apply(
+                                lambda r: "ZERO" if r["Current"] == 0 else ("LOW" if r["_low"] else "OK"),
+                                axis=1,
+                            )
+                            st.markdown("**By MSKU (city total)**")
+                            st.dataframe(
+                                cp[["MSKU", "Current", "Threshold", "Status"]],
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                        wh_rows = plan[plan["CityCode"] == city_code].copy()
+                        if not wh_rows.empty:
+                            wh_rows["Status"] = wh_rows.apply(
+                                lambda r: "ZERO" if r["Current"] == 0 else ("LOW" if r["_low"] else "OK"),
+                                axis=1,
+                            )
+                            st.markdown("**By warehouse**")
+                            st.dataframe(
+                                wh_rows[["Warehouse", "MSKU", "Current", "Threshold", "Status"]],
+                                use_container_width=True,
+                                hide_index=True,
+                            )
 
-    if velocity is not None and not velocity.empty:
+    st.subheader("🏬 Stock by warehouse")
+    warehouse_df = overview_warehouse_table(plan)
+    if warehouse_df.empty:
+        st.info("No warehouse data available for the selected SKUs.")
+    else:
+        st.dataframe(warehouse_df, use_container_width=True, hide_index=True)
+
+    if filtered_velocity is not None and not filtered_velocity.empty:
         with st.expander("📈 Units sold this period"):
-            st.dataframe(velocity.sort_values("Units Sold", ascending=False), hide_index=True)
-
-    with st.expander("🏬 Stock by warehouse"):
-        for loc in location_totals.sort_values(ascending=False).index:
-            loc_df = agg[agg["Location"] == loc].sort_values("Ending Warehouse Balance", ascending=False)
-            loc_total = int(loc_df["Ending Warehouse Balance"].sum())
-            loc_warn = " ⚠️" if loc in alerts_data["flagged_locations"] else ""
-            st.markdown(f"**{loc}**{loc_warn} — {loc_total} units")
-            for _, row in loc_df.iterrows():
-                city_code = extract_city_code(loc)
-                flagged = is_sku_flagged(loc, city_code, row["MSKU"], scope, alerts_data)
-                icon = "⚠️" if flagged else "·"
-                st.markdown(f"{icon} {row['MSKU']}: {int(row['Ending Warehouse Balance'])}")
+            st.dataframe(filtered_velocity.sort_values("Units Sold", ascending=False), hide_index=True)
 
     st.download_button(
         "⬇️ Download aggregated CSV",
-        data=agg.to_csv(index=False).encode("utf-8"),
+        data=filtered_agg.to_csv(index=False).encode("utf-8"),
         file_name="aggregated_sellable_by_location_msku.csv",
         mime="text/csv",
     )
@@ -1165,7 +1299,7 @@ def render_app(
         render_send_plan_tab(send_plan, source_key)
 
     with tab_overview:
-        render_overview_tab(agg, city_agg, velocity, settings, alerts_data)
+        render_overview_tab(agg, city_agg, velocity, settings, send_plan, source_key)
 
     with tab_map:
         render_map_tab(agg, settings, alerts_data)
