@@ -400,14 +400,28 @@ def build_scope_status_table(agg: pd.DataFrame, settings: dict) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values(["Status", "Qty"])
 
 
+def known_warehouses_df() -> pd.DataFrame:
+    locations = load_warehouse_locations()
+    rows = [
+        {"Location": code, "CityCode": extract_city_code(code)}
+        for code in sorted(locations.keys())
+    ]
+    return pd.DataFrame(rows)
+
+
 def expand_city_warehouse_stock(agg: pd.DataFrame) -> pd.DataFrame:
-    """All warehouses in the upload × all MSKUs present anywhere, zero-filled where absent."""
+    """All known FCs × all MSKUs present in the upload, zero-filled where absent."""
     stock = (
         agg.groupby(["Location", "CityCode", "MSKU"], as_index=False)["Ending Warehouse Balance"]
         .sum()
     )
     stock["MSKU"] = stock["MSKU"].astype(str)
-    warehouses = stock[["Location", "CityCode"]].drop_duplicates().sort_values(["CityCode", "Location"])
+    csv_warehouses = stock[["Location", "CityCode"]].drop_duplicates()
+    warehouses = (
+        pd.concat([csv_warehouses, known_warehouses_df()], ignore_index=True)
+        .drop_duplicates(subset=["Location"])
+        .sort_values(["CityCode", "Location"])
+    )
     all_mskus = sorted(stock["MSKU"].unique())
     rows: list[dict] = []
 
