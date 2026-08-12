@@ -1,7 +1,10 @@
+import base64
 import hmac
 import json
 import os
 import re
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -77,6 +80,195 @@ def normalize_settings(settings: dict) -> dict:
     return merged
 
 
+def _read_secret(key: str, default=None):
+    try:
+        val = st.secrets.get(key, default)
+        if val is not None and val != "":
+            return val
+    except (FileNotFoundError, KeyError, AttributeError):
+        pass
+    # Support [github] section in secrets.toml
+    aliases = {
+        "GITHUB_SETTINGS_TOKEN": ("token", "GITHUB_SETTINGS_TOKEN"),
+        "GITHUB_SETTINGS_REPO": ("repo", "GITHUB_SETTINGS_REPO"),
+        "GITHUB_SETTINGS_PATH": ("path", "GITHUB_SETTINGS_PATH"),
+    }
+    for section_name in ("github", "GITHUB", "settings"):
+        try:
+            section = st.secrets.get(section_name)
+            if isinstance(section, dict):
+                for alias in aliases.get(key, (key,)):
+                    if section.get(alias) is not None:
+                        return section.get(alias)
+        except (FileNotFoundError, KeyError, AttributeError):
+            continue
+    return default
+
+
+def github_settings_config() -> dict | None:
+    token = _read_secret("GITHUB_SETTINGS_TOKEN")
+    repo = _read_secret("GITHUB_SETTINGS_REPO")
+    if not token or not repo:
+        return None
+    return {
+        "token": str(token).strip().strip('"').strip("'"),
+        "repo": str(repo).strip().strip("/"),
+        "path": str(_read_secret("GITHUB_SETTINGS_PATH", "data/settings.json")).strip(),
+    }
+
+
+def _github_api_request(method: str, url: str, token: str, payload: dict | None = None) -> dict:
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+            "User-Agent": "azstock-settings-sync",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"GitHub API {exc.code}: {detail}") from exc
+
+
+def _github_contents_url(cfg: dict) -> str:
+    owner, repo_name = cfg["repo"].split("/", 1)
+    return f"https://api.github.com/repos/{owner}/{repo_name}/contents/{cfg['path']}"
+
+
+def _fetch_github_settings_file(cfg: dict) -> tuple[dict | None, str | None]:
+    url = _github_contents_url(cfg)
+    try:
+        result = _github_api_request("GET", url, cfg["token"])
+    except RuntimeError as exc:
+        if "GitHub API 404" in str(exc):
+            return None, None
+        raise
+    content = base64.b64decode(result["content"].replace("\n", "")).decode("utf-8")
+    return json.loads(content), result.get("sha")
+
+
+def _merge_session_settings(settings: dict) -> dict:
+    """Merge live session settings so partial saves keep overrides and thresholds."""
+    merged = dict(st.session_state.get("settings") or {})
+    merged.update(settings)
+    if "settings_selected_cities" in st.session_state:
+        merged["selected_cities"] = list(st.session_state.settings_selected_cities)
+    if "settings_excluded_warehouses" in st.session_state:
+        merged["excluded_warehouses"] = list(st.session_state.settings_excluded_warehouses)
+    if "settings_enabled" in st.session_state:
+        merged["enabled"] = bool(st.session_state.settings_enabled)
+    if "settings_global_threshold" in st.session_state:
+        merged["global_threshold"] = int(st.session_state.settings_global_threshold)
+    return merged
+
+
+def _settings_payload(settings: dict) -> dict:
+    merged = _merge_session_settings(settings)
+    to_save = normalize_settings(merged)
+    to_save.pop("selected_warehouses", None)
+    # JSON keys must be strings for sku_overrides
+    overrides = to_save.get("sku_overrides") or {}
+    to_save["sku_overrides"] = {str(k): int(v) for k, v in overrides.items()}
+    return to_save
+
+
+def _write_local_settings(settings: dict) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=2)
+
+
+def _load_settings_from_sources() -> dict:
+    cfg = github_settings_config()
+    if cfg:
+        try:
+            raw, sha = _fetch_github_settings_file(cfg)
+            if raw is not None:
+                st.session_state._settings_github_sha = sha
+                return normalize_settings(raw)
+        except Exception as exc:
+            st.session_state._settings_load_warning = f"Could not load settings from GitHub: {exc}"
+
+    if SETTINGS_FILE.exists():
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            return normalize_settings(json.load(f))
+
+    app_settings = _read_secret("APP_SETTINGS")
+    if app_settings:
+        if isinstance(app_settings, str):
+            return normalize_settings(json.loads(app_settings))
+        if isinstance(app_settings, dict):
+            return normalize_settings(app_settings)
+
+    return DEFAULT_SETTINGS.copy()
+
+
+def load_settings() -> dict:
+    cached = st.session_state.get("_settings_cache")
+    if cached is not None:
+        return dict(cached)
+    settings = _load_settings_from_sources()
+    st.session_state._settings_cache = settings
+    return dict(settings)
+
+
+def save_settings(settings: dict) -> None:
+    to_save = _settings_payload(settings)
+    st.session_state._settings_cache = to_save
+    st.session_state.settings = to_save
+
+    try:
+        _write_local_settings(to_save)
+    except OSError as exc:
+        st.session_state._settings_save_warning = f"Could not write local settings file: {exc}"
+
+    cfg = github_settings_config()
+    if cfg:
+        try:
+            _push_settings_to_github(cfg, to_save)
+            st.session_state.pop("_settings_save_warning", None)
+            st.session_state._settings_save_ok = True
+        except Exception as exc:
+            st.session_state._settings_save_warning = f"Could not save settings to GitHub: {exc}"
+            st.session_state._settings_save_ok = False
+    else:
+        st.session_state._settings_save_ok = True
+
+
+def _push_settings_to_github(cfg: dict, to_save: dict) -> None:
+    encoded = base64.b64encode(json.dumps(to_save, indent=2).encode("utf-8")).decode("ascii")
+    url = _github_contents_url(cfg)
+
+    for attempt in range(2):
+        sha = st.session_state.get("_settings_github_sha")
+        if not sha:
+            _, sha = _fetch_github_settings_file(cfg)
+        payload: dict = {
+            "message": "Update app settings",
+            "content": encoded,
+        }
+        if sha:
+            payload["sha"] = sha
+        try:
+            result = _github_api_request("PUT", url, cfg["token"], payload)
+            st.session_state._settings_github_sha = result.get("content", {}).get("sha")
+            return
+        except RuntimeError as exc:
+            if attempt == 0 and "GitHub API 409" in str(exc):
+                st.session_state.pop("_settings_github_sha", None)
+                continue
+            raise
+
+
 def send_plan_row_key(row: pd.Series, view_mode: str) -> tuple:
     if view_mode == "City":
         return (str(row["City"]), str(row["MSKU"]))
@@ -145,18 +337,20 @@ def export_csv_with_metadata(df: pd.DataFrame, metadata: list[str], footer: list
 
 
 def apply_filter_widgets_from_settings(settings: dict, agg: pd.DataFrame | None = None) -> None:
-    """Align filter widget keys with persisted settings."""
+    """Align settings widget keys with persisted settings."""
     city_options = all_city_options(agg)
     saved_cities = settings.get("selected_cities") or []
     if not saved_cities and settings.get("selected_warehouses"):
         saved_cities = sorted({extract_city_code(wh) for wh in settings["selected_warehouses"]})
-    default_cities = [city for city in saved_cities if city in city_options] or city_options
+    default_cities = [city for city in saved_cities if city in city_options]
     st.session_state.settings_selected_cities = default_cities
 
-    warehouse_options = warehouses_for_cities(default_cities, agg)
+    warehouse_options = warehouses_for_cities(default_cities or city_options, agg)
     st.session_state.settings_excluded_warehouses = [
         wh for wh in (settings.get("excluded_warehouses") or []) if wh in warehouse_options
     ]
+    st.session_state.settings_enabled = bool(settings.get("enabled", True))
+    st.session_state.settings_global_threshold = int(settings.get("global_threshold", DEFAULT_SETTINGS["global_threshold"]))
 
 
 def _ensure_settings() -> dict:
@@ -167,8 +361,9 @@ def _ensure_settings() -> dict:
 
 
 def bootstrap_settings(agg: pd.DataFrame | None = None) -> dict:
-    """Load settings from disk once per browser session and seed filter widgets."""
+    """Load settings from disk/GitHub once per browser session and seed filter widgets."""
     if not st.session_state.get("_settings_bootstrapped"):
+        st.session_state.pop("_settings_cache", None)
         st.session_state.settings = load_settings()
         apply_filter_widgets_from_settings(st.session_state.settings, agg)
         st.session_state._settings_bootstrapped = True
@@ -203,26 +398,19 @@ def _persist_excluded_warehouses(agg: pd.DataFrame | None = None) -> None:
     save_settings(settings)
 
 
+def _persist_alert_settings() -> None:
+    settings = _ensure_settings()
+    settings["enabled"] = bool(st.session_state.settings_enabled)
+    settings["global_threshold"] = int(st.session_state.settings_global_threshold)
+    settings["scope"] = "per_city"
+    st.session_state.settings = settings
+    save_settings(settings)
+
+
 @st.cache_data
 def load_warehouse_locations() -> dict[str, dict]:
     with open(LOCATIONS_FILE, encoding="utf-8") as f:
         return json.load(f)
-
-
-def load_settings() -> dict:
-    if SETTINGS_FILE.exists():
-        with open(SETTINGS_FILE, encoding="utf-8") as f:
-            saved = json.load(f)
-        return normalize_settings(saved)
-    return DEFAULT_SETTINGS.copy()
-
-
-def save_settings(settings: dict) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    to_save = normalize_settings(settings.copy())
-    to_save.pop("selected_warehouses", None)
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(to_save, f, indent=2)
 
 
 def load_history() -> list[dict]:
@@ -1228,20 +1416,40 @@ def render_settings_panel(settings: dict, agg: pd.DataFrame | None = None) -> di
     st.subheader("⚙️ Alert thresholds")
     st.caption("Each warehouse is checked separately. If an MSKU appears anywhere, every FC in selected cities is listed (0 where absent).")
 
+    if "settings_enabled" not in st.session_state:
+        st.session_state.settings_enabled = bool(settings.get("enabled", True))
+    if "settings_global_threshold" not in st.session_state:
+        st.session_state.settings_global_threshold = int(settings.get("global_threshold", 10))
+
     settings["enabled"] = st.checkbox(
         "Enable low-stock alerts",
-        value=settings.get("enabled", True),
+        key="settings_enabled",
+        on_change=_persist_alert_settings,
     )
     settings["global_threshold"] = st.number_input(
         "Default threshold (all MSKUs)",
         min_value=0,
-        value=int(settings.get("global_threshold", 10)),
+        key="settings_global_threshold",
+        on_change=_persist_alert_settings,
     )
     settings["scope"] = "per_city"
 
     st.divider()
     st.subheader("🏙️ Cities")
-    st.caption("City and warehouse filters apply immediately and save automatically.")
+    st.caption("All settings save automatically when changed.")
+    cfg = github_settings_config()
+    if cfg:
+        st.caption(f"Persisting to GitHub: `{cfg['repo']}` → `{cfg['path']}`")
+    else:
+        st.caption(f"Persisting to local file: `{SETTINGS_FILE.name}` (add GitHub secrets on Streamlit Cloud for durable storage).")
+    load_warning = st.session_state.get("_settings_load_warning")
+    save_warning = st.session_state.get("_settings_save_warning")
+    if load_warning:
+        st.warning(load_warning)
+    if save_warning:
+        st.warning(save_warning)
+    elif st.session_state.pop("_settings_save_ok", False):
+        st.success("Settings saved.")
     city_options = all_city_options(agg)
     settings["selected_cities"] = st.multiselect(
         "Cities to include",
@@ -1301,8 +1509,9 @@ def render_settings_panel(settings: dict, agg: pd.DataFrame | None = None) -> di
             st.write("")
             st.write("")
             if st.button("Set override", key="settings_set_override"):
-                overrides[pick_msku] = int(pick_thresh)
+                overrides[str(pick_msku)] = int(st.session_state.settings_pick_thresh)
                 settings["sku_overrides"] = overrides
+                st.session_state.settings = settings
                 save_settings(settings)
                 st.rerun()
 
@@ -1313,10 +1522,12 @@ def render_settings_panel(settings: dict, agg: pd.DataFrame | None = None) -> di
                 if rc2.button("Remove", key=f"settings_rm_{msku}"):
                     del overrides[msku]
                     settings["sku_overrides"] = overrides
+                    st.session_state.settings = settings
                     save_settings(settings)
                     st.rerun()
             if st.button("Clear all overrides"):
                 settings["sku_overrides"] = {}
+                st.session_state.settings = settings
                 save_settings(settings)
                 st.rerun()
         else:
@@ -1325,6 +1536,8 @@ def render_settings_panel(settings: dict, agg: pd.DataFrame | None = None) -> di
     sc1, sc2 = st.columns(2)
     with sc1:
         if st.button("Save settings", type="primary"):
+            settings["enabled"] = bool(st.session_state.settings_enabled)
+            settings["global_threshold"] = int(st.session_state.settings_global_threshold)
             settings["selected_cities"] = list(st.session_state.settings_selected_cities)
             settings["excluded_warehouses"] = list(st.session_state.settings_excluded_warehouses)
             wh_opts = set(warehouses_for_cities(settings.get("selected_cities") or [], agg))
@@ -1334,11 +1547,13 @@ def render_settings_panel(settings: dict, agg: pd.DataFrame | None = None) -> di
             settings = normalize_settings(settings)
             st.session_state.settings = settings
             save_settings(settings)
-            st.success("Settings saved to disk.")
+            st.success("Settings saved.")
+            st.rerun()
     with sc2:
         if st.button("Reset to defaults"):
             settings = DEFAULT_SETTINGS.copy()
             st.session_state.settings = settings
+            st.session_state._settings_cache = settings
             apply_filter_widgets_from_settings(settings, agg)
             save_settings(settings)
             st.rerun()
