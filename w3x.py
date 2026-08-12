@@ -31,6 +31,8 @@ LOCATIONS_FILE = DATA_DIR / "warehouse_locations.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 HISTORY_FILE = DATA_DIR / "history.json"
 LIS_RADIUS_KM = 300
+INDIA_MAP_CENTER = [22.0, 79.0]
+INDIA_MAP_ZOOM = 5
 LIS_CIRCLE_COLORS = (
     "#9b59b6",
     "#e74c3c",
@@ -354,6 +356,24 @@ def format_data_date(value) -> str | None:
     if pd.isna(parsed):
         return None
     return f"{int(parsed.day)} {parsed.strftime('%B').upper()} {parsed.year}"
+
+
+def format_export_date(value) -> str | None:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    text = str(value).strip()
+    parsed = pd.to_datetime(text, errors="coerce")
+    if pd.isna(parsed):
+        parsed = pd.to_datetime(text, dayfirst=True, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return f"{int(parsed.day)} {parsed.strftime('%B')} {parsed.year}"
+
+
+def send_plan_export_columns(view_mode: str) -> list[str]:
+    if view_mode == "City":
+        return ["Priority", "City", "MSKU", "Current", "Send qty", "Notes"]
+    return ["Priority", "City", "Warehouse", "MSKU", "Current", "Send qty", "Notes"]
 
 
 def extract_ledger_data_date(df: pd.DataFrame) -> str | None:
@@ -799,6 +819,73 @@ def _sku_table_html(
     return "".join(lines)
 
 
+def _map_alert_table_html(alert_rows: list[dict]) -> str:
+    if not alert_rows:
+        return ""
+    lines = [
+        "<table style='font-size:12px;border-collapse:collapse;width:100%'>",
+        "<tr><th style='text-align:left;padding:2px 6px'>MSKU</th>"
+        "<th style='text-align:right;padding:2px 6px'>Qty</th>"
+        "<th style='text-align:right;padding:2px 6px'>Threshold</th>"
+        "<th style='padding:2px 6px'>Status</th></tr>",
+    ]
+    for row in alert_rows:
+        qty = int(row["qty"])
+        status = "ZERO" if qty == 0 else "LOW"
+        lines.append(
+            f"<tr><td style='padding:2px 6px'>{row['MSKU']}</td>"
+            f"<td style='text-align:right;padding:2px 6px'>{qty:,}</td>"
+            f"<td style='text-align:right;padding:2px 6px'>{int(row['threshold']):,}</td>"
+            f"<td style='padding:2px 6px'>{status}</td></tr>"
+        )
+    lines.append("</table>")
+    return "".join(lines)
+
+
+def _alerts_for_location(loc: str, alerts_data: dict) -> list[dict]:
+    rows = [
+        {
+            "MSKU": a["MSKU"],
+            "qty": int(a["qty"]),
+            "threshold": int(a["threshold"]),
+        }
+        for a in alerts_data.get("alerts", [])
+        if a.get("location") == loc
+    ]
+    return sorted(rows, key=lambda r: (r["qty"], r["MSKU"]))
+
+
+def _alerts_for_city(city_code: str, agg: pd.DataFrame, alerts_data: dict) -> list[dict]:
+    flagged_mskus = {
+        msku for loc, msku in alerts_data.get("flagged_skus", set()) if extract_city_code(loc) == city_code
+    }
+    if not flagged_mskus:
+        return []
+    city_totals = {
+        str(msku): int(qty)
+        for msku, qty in (
+            agg[agg["CityCode"] == city_code]
+            .groupby("MSKU")["Ending Warehouse Balance"]
+            .sum()
+            .items()
+        )
+    }
+    threshold_by_msku = {
+        str(a["MSKU"]): int(a["threshold"])
+        for a in alerts_data.get("alerts", [])
+        if extract_city_code(a.get("location", "")) == city_code
+    }
+    rows = [
+        {
+            "MSKU": str(msku),
+            "qty": city_totals.get(str(msku), 0),
+            "threshold": threshold_by_msku.get(str(msku), 0),
+        }
+        for msku in flagged_mskus
+    ]
+    return sorted(rows, key=lambda r: (r["qty"], r["MSKU"]))
+
+
 def generate_html_report(agg_df, city_agg, timestamp):
     def tbl(headers, rows, hcolor="#2c6fad"):
         cols = "".join(f"<th>{h}</th>" for h in headers)
@@ -933,7 +1020,7 @@ def build_warehouse_map(
     unmapped = [loc for loc in loc_totals["Location"] if loc not in locations_db]
 
     if satellite_view:
-        m = folium.Map(location=[20.6, 78.9], zoom_start=4, tiles=None)
+        m = folium.Map(location=INDIA_MAP_CENTER, zoom_start=INDIA_MAP_ZOOM, tiles=None)
         folium.TileLayer(
             tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
             attr="Esri World Imagery",
@@ -948,9 +1035,7 @@ def build_warehouse_map(
             show=True,
         ).add_to(m)
     else:
-        m = folium.Map(location=[20.6, 78.9], zoom_start=4, tiles="OpenStreetMap")
-
-    map_bounds: list[list[float]] = []
+        m = folium.Map(location=INDIA_MAP_CENTER, zoom_start=INDIA_MAP_ZOOM, tiles="OpenStreetMap")
 
     if mode == "All warehouses":
         for _, row in loc_totals.iterrows():
@@ -970,6 +1055,8 @@ def build_warehouse_map(
             lat, lng = meta["lat"], meta["lng"]
 
             alert_n = alerts_data["location_alert_count"].get(loc, 0)
+            alert_rows = _alerts_for_location(loc, alerts_data)
+            alert_table = _map_alert_table_html(alert_rows)
             sku_table = _sku_table_html(
                 agg[agg["Location"] == loc].groupby("MSKU", as_index=False)[
                     "Ending Warehouse Balance"
@@ -979,12 +1066,18 @@ def build_warehouse_map(
                 is_city=False,
                 scope=scope,
             )
-            alert_line = f"<br><b>⚠️ Alerts:</b> {alert_n}" if alert_n else ""
+            alert_block = (
+                f"<br><b>⚠️ Low-stock alerts ({len(alert_rows)}):</b><br>{alert_table}"
+                if alert_rows
+                else ""
+            )
             popup_html = (
                 f"<b>{loc}</b><br>"
                 f"{meta.get('address', '')}<br>"
                 f"{meta.get('city', '')}, {meta.get('state', '')}<br>"
-                f"<b>Sellable:</b> {sellable:,}{alert_line}<br><br>{sku_table}"
+                f"<b>Sellable:</b> {sellable:,}"
+                f"{alert_block}"
+                f"<br><br><b>All SKUs:</b><br>{sku_table}"
             )
             color = "#d9534f" if is_low else "#2c6fad"
             fill = "#e74c3c" if is_low else "#4a90d9"
@@ -1014,9 +1107,8 @@ def build_warehouse_map(
                 fill_color=fill,
                 fill_opacity=0.85,
                 tooltip=tooltip,
-                popup=folium.Popup(popup_html, max_width=400),
+                popup=folium.Popup(popup_html, max_width=440),
             ).add_to(m)
-            map_bounds.append([lat, lng])
     else:
         filtered = loc_totals
         if selected_cities:
@@ -1042,6 +1134,8 @@ def build_warehouse_map(
             fc_count = len(mapped)
             city_name = city_display_name(city_code)
             alert_n = _city_alert_total(city_code, alerts_data, agg)
+            alert_rows = _alerts_for_city(city_code, agg, alerts_data)
+            alert_table = _map_alert_table_html(alert_rows)
 
             city_sku = (
                 agg[agg["CityCode"] == city_code]
@@ -1050,15 +1144,18 @@ def build_warehouse_map(
             )
             sku_table = _sku_table_html(city_sku, alerts_data, city_code, is_city=True, scope=scope)
 
-            breakdown = " · ".join(
-                f"{r['Location']}: {int(r['sellable']):,}"
-                for _, r in mapped.sort_values("sellable", ascending=False).iterrows()
+            wh_list = ", ".join(sorted(mapped["Location"].astype(str)))
+            alert_block = (
+                f"<br><b>⚠️ Low-stock alerts ({len(alert_rows)}):</b><br>{alert_table}"
+                if alert_rows
+                else ""
             )
-            alert_line = f"<br><b>⚠️ Alerts:</b> {alert_n}" if alert_n else ""
             popup_html = (
                 f"<b>{city_name}</b> ({city_code})<br>"
-                f"<b>Sellable:</b> {total_sellable:,}{alert_line}<br>"
-                f"<b>Warehouses ({fc_count}):</b> {breakdown}<br><br>{sku_table}"
+                f"<b>Warehouses ({fc_count}):</b> {wh_list}<br>"
+                f"<b>Sellable:</b> {total_sellable:,}"
+                f"{alert_block}"
+                f"<br><br><b>All SKUs (city total):</b><br>{sku_table}"
             )
             color = "#d9534f" if is_low else "#1a3e6e"
             fill = "#e74c3c" if is_low else "#2c6fad"
@@ -1075,12 +1172,8 @@ def build_warehouse_map(
                 fill_color=fill,
                 fill_opacity=0.9,
                 tooltip=tooltip,
-                popup=folium.Popup(popup_html, max_width=420),
+                popup=folium.Popup(popup_html, max_width=440),
             ).add_to(m)
-            map_bounds.append([lat, lng])
-
-    if map_bounds:
-        m.fit_bounds(map_bounds, padding=(40, 40))
 
     return m, unmapped
 
@@ -1398,24 +1491,29 @@ def render_send_plan_tab(
     total_send = int(edited["Send qty"].fillna(0).sum())
     st.caption(f"**Total send qty:** {total_send:,} units")
 
+    export_cols = send_plan_export_columns(view_mode)
+    export_df = edited[[c for c in export_cols if c != "Notes"]].copy()
+    export_df["Notes"] = ""
+
+    export_date = format_export_date(ledger_data_date) or format_export_date(datetime.now())
     export_meta = [
-        f"Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Exported: {format_export_date(datetime.now())}",
         f"View: {view_mode}",
         f"SKUs: {', '.join(selected_skus)}",
     ]
-    if ledger_data_date:
-        export_meta.append(f"Ledger data date: {ledger_data_date}")
-    footer = ["TOTAL", "", "", "", "", "", str(total_send)] if view_mode == "City" else [
-        "TOTAL", "", "", "", "", "", "", str(total_send)
-    ]
-    while len(footer) < len(display_cols):
-        footer.insert(-1, "")
-    footer = footer[: len(display_cols)]
+    if export_date:
+        export_meta.append(f"Ledger data date: {export_date}")
 
-    date_slug = ledger_data_date.replace(" ", "_") if ledger_data_date else datetime.now().strftime("%Y%m%d")
+    footer = (
+        ["TOTAL", "", "", "", str(total_send), ""]
+        if view_mode == "City"
+        else ["TOTAL", "", "", "", "", str(total_send), ""]
+    )
+
+    date_slug = export_date.replace(" ", "_") if export_date else datetime.now().strftime("%d_%B_%Y")
     st.download_button(
         label="⬇️ Export send plan CSV",
-        data=export_csv_with_metadata(edited[display_cols], export_meta, footer=footer),
+        data=export_csv_with_metadata(export_df[export_cols], export_meta, footer=footer),
         file_name=f"send_plan_{view_mode.lower()}_{date_slug}.csv",
         mime="text/csv",
     )
