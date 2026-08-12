@@ -21,6 +21,7 @@
   "excluded_warehouses": [
     "BLR4",
     "BLR5",
-    "BOM1"
+    "BOM1",
+    "BOM3"
   ]
 }
