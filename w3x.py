@@ -132,6 +132,13 @@ def apply_filter_widgets_from_settings(settings: dict, agg: pd.DataFrame | None 
     ]
 
 
+def _ensure_settings() -> dict:
+    """Return session settings, loading from disk if needed (on_change runs before main script)."""
+    if "settings" not in st.session_state:
+        st.session_state.settings = load_settings()
+    return dict(st.session_state.settings)
+
+
 def bootstrap_settings(agg: pd.DataFrame | None = None) -> dict:
     """Load settings from disk once per browser session and seed filter widgets."""
     if not st.session_state.get("_settings_bootstrapped"):
@@ -142,11 +149,16 @@ def bootstrap_settings(agg: pd.DataFrame | None = None) -> dict:
 
 
 def _persist_city_filters(agg: pd.DataFrame | None = None) -> None:
-    settings = dict(st.session_state.settings)
+    settings = _ensure_settings()
     cities = list(st.session_state.settings_selected_cities)
     settings["selected_cities"] = cities
     wh_opts = set(warehouses_for_cities(cities, agg))
-    excluded = [wh for wh in st.session_state.settings_excluded_warehouses if wh in wh_opts]
+    excluded = list(
+        st.session_state.get("settings_excluded_warehouses")
+        or settings.get("excluded_warehouses")
+        or []
+    )
+    excluded = [wh for wh in excluded if wh in wh_opts]
     st.session_state.settings_excluded_warehouses = excluded
     settings["excluded_warehouses"] = excluded
     st.session_state.settings = settings
@@ -154,7 +166,7 @@ def _persist_city_filters(agg: pd.DataFrame | None = None) -> None:
 
 
 def _persist_excluded_warehouses(agg: pd.DataFrame | None = None) -> None:
-    settings = dict(st.session_state.settings)
+    settings = _ensure_settings()
     cities = settings.get("selected_cities") or list(st.session_state.settings_selected_cities)
     wh_opts = set(warehouses_for_cities(cities, agg))
     excluded = [wh for wh in st.session_state.settings_excluded_warehouses if wh in wh_opts]
