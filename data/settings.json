@@ -19,6 +19,7 @@
     "PNQ"
   ],
   "excluded_warehouses": [
-    "BLR4"
+    "BLR4",
+    "BLR5"
   ]
 }
