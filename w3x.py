@@ -91,10 +91,23 @@ def suggested_send_qty(row: pd.Series) -> int:
     return max(0, int(row["Threshold"]) - int(row["Current"]))
 
 
+def send_qty_is_blank(val) -> bool:
+    return val is None or pd.isna(val)
+
+
+def sum_send_qty(series: pd.Series) -> float:
+    """Sum send qty for city rollup; stay blank when every warehouse row is blank."""
+    if series.notna().any():
+        return float(series.fillna(0).sum())
+    return float("nan")
+
+
 def merge_send_qty_from_store(table: pd.DataFrame, store: dict, view_mode: str) -> pd.DataFrame:
-    if table.empty or not store:
+    if table.empty:
         return table
     out = table.copy()
+    if "Send qty" not in out.columns:
+        out["Send qty"] = pd.NA
     for idx, row in out.iterrows():
         key = send_plan_row_key(row, view_mode)
         if key in store:
@@ -102,9 +115,23 @@ def merge_send_qty_from_store(table: pd.DataFrame, store: dict, view_mode: str) 
     return out
 
 
-def persist_send_qty_to_store(table: pd.DataFrame, store: dict, view_mode: str) -> None:
-    for _, row in table.iterrows():
-        store[send_plan_row_key(row, view_mode)] = int(row.get("Send qty") or 0)
+def persist_send_qty_to_store(
+    before: pd.DataFrame,
+    after: pd.DataFrame,
+    store: dict,
+    view_mode: str,
+) -> None:
+    for idx, row in after.iterrows():
+        key = send_plan_row_key(row, view_mode)
+        val = row.get("Send qty")
+        before_val = before.loc[idx, "Send qty"] if idx in before.index else pd.NA
+
+        if send_qty_is_blank(val):
+            store.pop(key, None)
+        elif int(val) == 0 and send_qty_is_blank(before_val) and key not in store:
+            continue
+        else:
+            store[key] = int(val)
 
 
 def export_csv_with_metadata(df: pd.DataFrame, metadata: list[str], footer: list[str] | None = None) -> bytes:
@@ -698,7 +725,7 @@ def build_send_plan(agg: pd.DataFrame, settings: dict) -> pd.DataFrame:
                 "Threshold": threshold,
                 "Shortfall": shortfall,
                 "Shortfall %": round(shortfall_pct, 1),
-                "Send qty": 0,
+                "Send qty": pd.NA,
                 "_low": current <= threshold,
                 "_zero": current == 0,
             }
@@ -722,7 +749,7 @@ def aggregate_send_plan_by_city(plan: pd.DataFrame) -> pd.DataFrame:
         .agg(
             Current=("Current", "sum"),
             Threshold=("Threshold", "first"),
-            Send_qty=("Send qty", "sum"),
+            Send_qty=("Send qty", sum_send_qty),
         )
         .rename(columns={"Send_qty": "Send qty"})
     )
@@ -1391,7 +1418,7 @@ def prepare_send_plan_table(
 
     view["Suggested"] = view.apply(suggested_send_qty, axis=1)
     if "Send qty" not in view.columns:
-        view["Send qty"] = 0
+        view["Send qty"] = pd.NA
 
     if sort_by not in display_cols:
         sort_by = "Priority"
@@ -1469,6 +1496,7 @@ def render_send_plan_tab(
     store_key = send_qty_store_key(source_key, view_mode)
     qty_store: dict = st.session_state.setdefault(store_key, {})
     table = merge_send_qty_from_store(table, qty_store, view_mode)
+    table["Send qty"] = pd.to_numeric(table["Send qty"], errors="coerce")
 
     editor_key = f"send_plan_editor_{view_mode.lower()}_{source_key}"
     fill1, fill2, fill3, _ = st.columns([1, 1, 1, 2])
@@ -1512,14 +1540,17 @@ def render_send_plan_tab(
         use_container_width=True,
         key=editor_key,
     )
-    persist_send_qty_to_store(edited, qty_store, view_mode)
+    persist_send_qty_to_store(table, edited, qty_store, view_mode)
     st.session_state[store_key] = qty_store
 
-    total_send = int(edited["Send qty"].fillna(0).sum())
+    total_send = int(edited["Send qty"].dropna().sum())
     st.caption(f"**Total send qty:** {total_send:,} units")
 
     export_cols = send_plan_export_columns(view_mode)
     export_df = edited[[c for c in export_cols if c != "Notes"]].copy()
+    export_df["Send qty"] = export_df["Send qty"].apply(
+        lambda x: "" if send_qty_is_blank(x) else int(x)
+    )
     export_df["Notes"] = ""
 
     export_date = format_export_date(ledger_data_date) or format_export_date(datetime.now())
