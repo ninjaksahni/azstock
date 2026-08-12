@@ -8,5 +8,9 @@
     "PT16G": 15,
     "PT16RG": 15,
     "MT1": 10
-  }
+  },
+  "selected_cities": [
+    "BLR"
+  ],
+  "excluded_warehouses": []
 }
