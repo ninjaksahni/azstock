@@ -116,7 +116,7 @@ def export_csv_with_metadata(df: pd.DataFrame, metadata: list[str], footer: list
 
 
 def sync_live_filter_settings(settings: dict, agg: pd.DataFrame | None = None) -> None:
-    """Apply city/warehouse filter changes to session immediately."""
+    """Apply city/warehouse filter changes to session and persist to disk."""
     live = st.session_state.settings
     new_cities = settings.get("selected_cities") or []
     new_excluded = settings.get("excluded_warehouses") or []
@@ -130,7 +130,29 @@ def sync_live_filter_settings(settings: dict, agg: pd.DataFrame | None = None) -
     live["selected_cities"] = new_cities
     live["excluded_warehouses"] = new_excluded
     st.session_state.settings = live
+    st.session_state.settings_selected_cities = new_cities
+    st.session_state.settings_excluded_warehouses = new_excluded
+    save_settings(live)
     st.rerun()
+
+
+def init_filter_widget_state(settings: dict, agg: pd.DataFrame | None = None) -> None:
+    """Seed filter widget keys from saved settings on first load."""
+    city_options = all_city_options(agg)
+    saved_cities = settings.get("selected_cities") or []
+    if not saved_cities and settings.get("selected_warehouses"):
+        saved_cities = sorted({extract_city_code(wh) for wh in settings["selected_warehouses"]})
+    default_cities = [city for city in saved_cities if city in city_options] or city_options
+
+    if "settings_selected_cities" not in st.session_state:
+        st.session_state.settings_selected_cities = default_cities
+
+    warehouse_options = warehouses_for_cities(st.session_state.settings_selected_cities, agg)
+    saved_excluded = [
+        wh for wh in (settings.get("excluded_warehouses") or []) if wh in warehouse_options
+    ]
+    if "settings_excluded_warehouses" not in st.session_state:
+        st.session_state.settings_excluded_warehouses = saved_excluded
 
 
 @st.cache_data
@@ -1080,17 +1102,12 @@ def render_settings_panel(settings: dict, agg: pd.DataFrame | None = None) -> di
 
     st.divider()
     st.subheader("🏙️ Cities")
-    st.caption("Filters apply immediately. **Save settings** persists across restarts.")
+    st.caption("City and warehouse filters apply immediately and save automatically.")
     city_options = all_city_options(agg)
-    saved_cities = settings.get("selected_cities")
-    if saved_cities is None and settings.get("selected_warehouses"):
-        saved_cities = sorted({extract_city_code(wh) for wh in settings["selected_warehouses"]})
-    saved_cities = saved_cities or []
-    default_cities = [city for city in saved_cities if city in city_options] or city_options
+    init_filter_widget_state(settings, agg)
     settings["selected_cities"] = st.multiselect(
         "Cities to include",
         options=city_options,
-        default=default_cities,
         format_func=lambda code: f"{city_display_name(code)} ({code})",
         help="All warehouses in a selected city are included.",
         key="settings_selected_cities",
@@ -1112,13 +1129,9 @@ def render_settings_panel(settings: dict, agg: pd.DataFrame | None = None) -> di
     st.divider()
     st.subheader("🏭 Warehouses")
     warehouse_options = warehouses_for_cities(settings["selected_cities"] or [], agg)
-    saved_excluded = [
-        wh for wh in (settings.get("excluded_warehouses") or []) if wh in warehouse_options
-    ]
     settings["excluded_warehouses"] = st.multiselect(
         "Excluded warehouses",
         options=warehouse_options,
-        default=saved_excluded,
         help="These FCs are omitted from Send Plan, Overview, and Map.",
         key="settings_excluded_warehouses",
     )
@@ -1794,6 +1807,8 @@ with st.sidebar:
 
 if "settings" not in st.session_state:
     st.session_state.settings = load_settings()
+
+init_filter_widget_state(st.session_state.settings, agg=None)
 
 if "active_snapshot_id" not in st.session_state:
     history = load_history()
