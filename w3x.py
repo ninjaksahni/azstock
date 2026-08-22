@@ -187,20 +187,54 @@ def _write_local_settings(settings: dict) -> None:
         json.dump(settings, f, indent=2)
 
 
+def _load_local_settings_file() -> dict | None:
+    if not SETTINGS_FILE.exists():
+        return None
+    with open(SETTINGS_FILE, encoding="utf-8") as f:
+        return normalize_settings(json.load(f))
+
+
+def _load_github_settings(cfg: dict) -> dict | None:
+    raw, sha = _fetch_github_settings_file(cfg)
+    if raw is None:
+        return None
+    st.session_state._settings_github_sha = sha
+    return normalize_settings(raw)
+
+
+def _merge_settings_sources(*sources: dict) -> dict:
+    """Merge settings blobs; keep non-empty city, warehouse, and override lists."""
+    merged = DEFAULT_SETTINGS.copy()
+    for src in sources:
+        if not src:
+            continue
+        norm = normalize_settings(src)
+        for key, val in norm.items():
+            if key in ("selected_cities", "excluded_warehouses", "sku_overrides"):
+                if val:
+                    merged[key] = val
+            else:
+                merged[key] = val
+    return normalize_settings(merged)
+
+
 def _load_settings_from_sources() -> dict:
+    sources: list[dict] = []
     cfg = github_settings_config()
     if cfg:
         try:
-            raw, sha = _fetch_github_settings_file(cfg)
-            if raw is not None:
-                st.session_state._settings_github_sha = sha
-                return normalize_settings(raw)
+            github_settings = _load_github_settings(cfg)
+            if github_settings is not None:
+                sources.append(github_settings)
         except Exception as exc:
             st.session_state._settings_load_warning = f"Could not load settings from GitHub: {exc}"
 
-    if SETTINGS_FILE.exists():
-        with open(SETTINGS_FILE, encoding="utf-8") as f:
-            return normalize_settings(json.load(f))
+    local_settings = _load_local_settings_file()
+    if local_settings is not None:
+        sources.append(local_settings)
+
+    if sources:
+        return _merge_settings_sources(*sources)
 
     app_settings = _read_secret("APP_SETTINGS")
     if app_settings:
@@ -212,13 +246,30 @@ def _load_settings_from_sources() -> dict:
     return DEFAULT_SETTINGS.copy()
 
 
-def load_settings() -> dict:
-    cached = st.session_state.get("_settings_cache")
-    if cached is not None:
-        return dict(cached)
+def load_settings(force_refresh: bool = False) -> dict:
+    if not force_refresh:
+        cached = st.session_state.get("_settings_cache")
+        if cached is not None:
+            return dict(cached)
     settings = _load_settings_from_sources()
     st.session_state._settings_cache = settings
     return dict(settings)
+
+
+def refresh_settings_from_storage(
+    agg: pd.DataFrame | None = None,
+    source_key: str | None = None,
+) -> dict:
+    """Reload settings.json from disk/GitHub and apply to session + widgets."""
+    refresh_key = source_key or "_default"
+    if st.session_state.get("_settings_applied_for") == refresh_key:
+        return st.session_state.settings
+
+    settings = load_settings(force_refresh=True)
+    st.session_state.settings = settings
+    apply_filter_widgets_from_settings(settings, agg)
+    st.session_state._settings_applied_for = refresh_key
+    return settings
 
 
 def save_settings(settings: dict) -> None:
@@ -242,6 +293,8 @@ def save_settings(settings: dict) -> None:
             st.session_state._settings_save_ok = False
     else:
         st.session_state._settings_save_ok = True
+
+    st.session_state.pop("_settings_applied_for", None)
 
 
 def _push_settings_to_github(cfg: dict, to_save: dict) -> None:
@@ -363,9 +416,7 @@ def _ensure_settings() -> dict:
 def bootstrap_settings(agg: pd.DataFrame | None = None) -> dict:
     """Load settings from disk/GitHub once per browser session and seed filter widgets."""
     if not st.session_state.get("_settings_bootstrapped"):
-        st.session_state.pop("_settings_cache", None)
-        st.session_state.settings = load_settings()
-        apply_filter_widgets_from_settings(st.session_state.settings, agg)
+        refresh_settings_from_storage(agg)
         st.session_state._settings_bootstrapped = True
     return st.session_state.settings
 
@@ -1558,8 +1609,8 @@ def render_settings_panel(settings: dict, agg: pd.DataFrame | None = None) -> di
             save_settings(settings)
             st.rerun()
 
-    st.session_state.settings = settings
-    return settings
+    st.session_state.settings = _merge_session_settings(settings)
+    return st.session_state.settings
 
 
 def render_history_panel() -> None:
@@ -2087,6 +2138,8 @@ def render_app(
 
     st.caption(f"Data source: **{source_label}**")
 
+    # Apply persisted city/warehouse filters from storage for this dataset.
+    refresh_settings_from_storage(agg, source_key)
     settings = st.session_state.settings
     settings["scope"] = "per_city"
     agg, city_agg = apply_city_filter(agg, city_agg, settings)
@@ -2270,7 +2323,7 @@ if uploaded_file is not None and not st.session_state.get("prefer_history"):
             ledger_data_date = snapshot_ledger_data_date(saved) or ledger_data_date
 
     render_app(
-        agg, city_agg, velocity, settings, source_label, source_key, recorded_date, ledger_data_date
+        agg, city_agg, velocity, st.session_state.settings, source_label, source_key, recorded_date, ledger_data_date
     )
 
 else:
@@ -2293,7 +2346,7 @@ else:
         recorded_date = snapshot_recorded_date(snap)
         ledger_data_date = snapshot_ledger_data_date(snap)
         render_app(
-            agg, city_agg, velocity, settings, source_label, source_key, recorded_date, ledger_data_date
+            agg, city_agg, velocity, st.session_state.settings, source_label, source_key, recorded_date, ledger_data_date
         )
     else:
         st.info("Upload a CSV to get started. Saved snapshots appear under **History & Settings**.")
