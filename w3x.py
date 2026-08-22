@@ -1,6 +1,7 @@
 import base64
 import hmac
 import json
+import math
 import os
 import re
 import urllib.error
@@ -9,8 +10,11 @@ from datetime import datetime
 from pathlib import Path
 
 import folium
+import numpy as np
 import pandas as pd
 import streamlit as st
+from shapely.geometry import box, mapping
+from shapely.ops import unary_union
 from streamlit_folium import st_folium
 
 st.set_page_config(page_title="Amazon Warehouse Stock", layout="wide")
@@ -34,6 +38,18 @@ LOCATIONS_FILE = DATA_DIR / "warehouse_locations.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 HISTORY_FILE = DATA_DIR / "history.json"
 LIS_RADIUS_KM = 300
+LIS_HEATMAP_COLORS = {
+    1: "#c4b5fd",
+    2: "#8b5cf6",
+    3: "#6d28d9",
+    4: "#4c1d95",
+}
+LIS_HEATMAP_FILL_OPACITY = {
+    1: 0.14,
+    2: 0.20,
+    3: 0.26,
+    4: 0.32,
+}
 INDIA_MAP_CENTER = [22.0, 79.0]
 INDIA_MAP_ZOOM = 5
 LIS_CIRCLE_COLORS = (
@@ -62,6 +78,75 @@ LIS_CIRCLE_COLORS = (
 
 def lis_circle_color(loc: str) -> str:
     return LIS_CIRCLE_COLORS[sum(ord(c) for c in loc) % len(LIS_CIRCLE_COLORS)]
+
+
+def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    radius_earth_km = 6371.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    d_phi = math.radians(lat2 - lat1)
+    d_lambda = math.radians(lng2 - lng1)
+    a = math.sin(d_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2
+    return 2 * radius_earth_km * math.asin(math.sqrt(a))
+
+
+@st.cache_data
+def compute_lis_coverage_layers(
+    warehouse_coords: tuple[tuple[float, float], ...],
+    radius_km: float = LIS_RADIUS_KM,
+    resolution_deg: float = 0.08,
+) -> dict[int, dict]:
+    """Build merged LIS coverage polygons grouped by overlap count (1, 2, 3, 4+ FCs)."""
+    if not warehouse_coords:
+        return {}
+
+    coords = list(warehouse_coords)
+    lats = [lat for lat, _ in coords]
+    lngs = [lng for _, lng in coords]
+    margin = radius_km / 111.0 * 1.15
+    lat_min, lat_max = min(lats) - margin, max(lats) + margin
+    lng_min, lng_max = min(lngs) - margin, max(lngs) + margin
+
+    lat_steps = np.arange(lat_min, lat_max + resolution_deg, resolution_deg)
+    lng_steps = np.arange(lng_min, lng_max + resolution_deg, resolution_deg)
+    if len(lat_steps) < 2 or len(lng_steps) < 2:
+        return {}
+
+    cell_polys: dict[int, list] = {}
+    for i in range(len(lat_steps) - 1):
+        lat_c = (lat_steps[i] + lat_steps[i + 1]) / 2
+        for j in range(len(lng_steps) - 1):
+            lng_c = (lng_steps[j] + lng_steps[j + 1]) / 2
+            coverage = 0
+            for wh_lat, wh_lng in coords:
+                if haversine_km(lat_c, lng_c, wh_lat, wh_lng) <= radius_km:
+                    coverage += 1
+            if coverage <= 0:
+                continue
+            level = min(coverage, 4)
+            cell_polys.setdefault(level, []).append(
+                box(lng_steps[j], lat_steps[i], lng_steps[j + 1], lat_steps[i + 1])
+            )
+
+    layers: dict[int, dict] = {}
+    for level, polygons in cell_polys.items():
+        merged = unary_union(polygons)
+        if merged.is_empty:
+            continue
+        layers[level] = mapping(merged)
+    return layers
+
+
+def add_merged_lis_layers(map_obj: folium.Map, layers: dict[int, dict]) -> None:
+    for level in sorted(layers.keys()):
+        folium.GeoJson(
+            layers[level],
+            style_function=lambda _feature, lvl=level: {
+                "fillColor": LIS_HEATMAP_COLORS[lvl],
+                "color": LIS_HEATMAP_COLORS[lvl],
+                "weight": 0.6,
+                "fillOpacity": LIS_HEATMAP_FILL_OPACITY[lvl],
+            },
+        ).add_to(map_obj)
 
 DEFAULT_SETTINGS = {
     "enabled": True,
@@ -1306,6 +1391,7 @@ def build_warehouse_map(
     show_low_stock_only: bool = False,
     scope: str = "per_city",
     show_lis_radius: bool = False,
+    show_merged_lis_area: bool = False,
     satellite_view: bool = False,
     settings: dict | None = None,
 ) -> tuple[folium.Map, list[str]]:
@@ -1330,6 +1416,17 @@ def build_warehouse_map(
         ).add_to(m)
     else:
         m = folium.Map(location=INDIA_MAP_CENTER, zoom_start=INDIA_MAP_ZOOM, tiles="OpenStreetMap")
+
+    if show_merged_lis_area and settings:
+        lis_warehouses = effective_warehouses(settings, agg)
+        lis_coords = tuple(
+            (locations_db[loc]["lat"], locations_db[loc]["lng"])
+            for loc in lis_warehouses
+            if loc in locations_db
+        )
+        if lis_coords:
+            coverage_layers = compute_lis_coverage_layers(lis_coords)
+            add_merged_lis_layers(m, coverage_layers)
 
     if mode == "All warehouses":
         for _, row in loc_totals.iterrows():
@@ -1380,7 +1477,7 @@ def build_warehouse_map(
             if alert_n:
                 tooltip += f" · ⚠️ {alert_n} alert{'s' if alert_n != 1 else ''}"
 
-            if show_lis_radius:
+            if show_lis_radius and not show_merged_lis_area:
                 lis_color = lis_circle_color(loc)
                 folium.Circle(
                     location=[lat, lng],
@@ -2080,13 +2177,22 @@ def render_map_tab(agg: pd.DataFrame, settings: dict, alerts_data: dict) -> None
     with mc3:
         show_low_only = st.checkbox("Low stock only", value=True, key="pref_map_low_stock_only")
 
-    opt1, opt2 = st.columns(2)
+    opt1, opt2, opt3 = st.columns(3)
     with opt1:
         satellite_view = st.checkbox("Satellite view", value=False, key="pref_satellite_view")
-    with opt2:
-        show_lis_radius = False
-        if map_mode == "All warehouses":
-            show_lis_radius = st.checkbox("SHOW LIS RADIUS", value=False, key="pref_show_lis_radius")
+    show_merged_lis_area = False
+    show_lis_radius = False
+    if map_mode == "All warehouses":
+        with opt2:
+            show_merged_lis_area = st.checkbox(
+                "Show Merged LIS Area",
+                value=False,
+                key="pref_show_merged_lis",
+                help="Merged 300 km LIS coverage for all enabled FCs. Darker = more overlapping warehouses.",
+            )
+        with opt3:
+            if not show_merged_lis_area:
+                show_lis_radius = st.checkbox("SHOW LIS RADIUS", value=False, key="pref_show_lis_radius")
 
     warehouse_map, unmapped = build_warehouse_map(
         agg,
@@ -2097,9 +2203,15 @@ def render_map_tab(agg: pd.DataFrame, settings: dict, alerts_data: dict) -> None
         show_low_stock_only=show_low_only,
         scope="per_city",
         show_lis_radius=show_lis_radius,
+        show_merged_lis_area=show_merged_lis_area,
         satellite_view=satellite_view,
         settings=settings,
     )
+    if show_merged_lis_area:
+        st.caption(
+            "LIS heatmap uses all enabled FCs from settings. "
+            "Light violet = 1 FC · darker violet = more overlapping 300 km coverage."
+        )
     excluded = excluded_warehouses(settings)
     if excluded:
         st.caption(f"Excluded from map: {', '.join(sorted(excluded))}")

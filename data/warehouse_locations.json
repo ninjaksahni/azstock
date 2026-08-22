@@ -20,16 +20,16 @@
     "city": "Anekal",
     "state": "Karnataka",
     "address": "Survey No. 51/1, Thatanahalli Village, Anekal Taluk, Bengaluru 562107",
-    "lat": 12.748395,
-    "lng": 77.733837
+    "lat": 12.7487373,
+    "lng": 77.7311824
   },
   "BLR8": {
     "name": "Amazon FC BLR8",
     "city": "Devanahalli",
     "state": "Karnataka",
     "address": "Building 2, Plot No. 12/P2 (IT Sector), Hitech Defence and Aerospace Park, Devanahalli, Bengaluru 562149",
-    "lat": 13.2236,
-    "lng": 77.7716
+    "lat": 13.1653886,
+    "lng": 77.7011961
   },
   "BOM1": {
     "name": "Amazon FC BOM1",
@@ -60,8 +60,8 @@
     "city": "Bhiwandi",
     "state": "Maharashtra",
     "address": "Building WE-I, Renaissance Industrial Smart City, Kalyan-Sape Road, Vashere, Bhiwandi, Maharashtra 421302",
-    "lat": 19.332096,
-    "lng": 73.161565
+    "lat": 19.3320944,
+    "lng": 73.1578208
   },
   "BOM6": {
     "name": "Amazon FC BOM6",
@@ -76,8 +76,8 @@
     "city": "Bhiwandi",
     "state": "Maharashtra",
     "address": "Building 5, BGR Warehousing Complex, Village Vahuli, Mumbai-Nashik Expressway, Bhiwandi 421302",
-    "lat": 19.28983,
-    "lng": 73.099017
+    "lat": 19.3534403,
+    "lng": 73.1384771
   },
   "BOM9": {
     "name": "Amazon FC BOM9",
@@ -92,8 +92,8 @@
     "city": "Coimbatore",
     "state": "Tamil Nadu",
     "address": "Survey No.153-1, Chettipalayam, Oratakuppai Village, Palladam Main Road, Coimbatore 641201",
-    "lat": 10.92335,
-    "lng": 77.054224
+    "lat": 10.9237825,
+    "lng": 77.0515891
   },
   "DEL2": {
     "name": "Amazon FC DEL2",
@@ -108,32 +108,32 @@
     "city": "Jamalpur",
     "state": "Haryana",
     "address": "Jamalpur-Panchgaon Road, Kharkari, Jamalpur, Gurgaon, Haryana 122503",
-    "lat": 28.366774,
-    "lng": 76.85299
+    "lat": 28.3667743,
+    "lng": 76.8507838
   },
   "DEL5": {
     "name": "Amazon FC DEL5",
     "city": "Manesar",
     "state": "Haryana",
     "address": "Adjacent to Starex School, Binola, NH-48, Manesar, Gurgaon, Haryana 122413",
-    "lat": 28.296769,
-    "lng": 76.86523
+    "lat": 28.2977202,
+    "lng": 76.8590283
   },
   "HYD3": {
     "name": "Amazon FC HYD3",
     "city": "Shamshabad",
     "state": "Telangana",
     "address": "Shamshabad, Hyderabad, Telangana 501218",
-    "lat": 17.237472,
-    "lng": 78.44672
+    "lat": 17.2392949,
+    "lng": 78.4406625
   },
   "HYD8": {
     "name": "Amazon FC HYD8",
     "city": "Shamshabad",
     "state": "Telangana",
     "address": "Survey No. 99/1, Mamidipally Village, Shamshabad, Hyderabad, Telangana 501218",
-    "lat": 17.238729,
-    "lng": 78.441039
+    "lat": 17.2386782,
+    "lng": 78.4454337
   },
   "LKO1": {
     "name": "Amazon FC LKO1",
@@ -148,8 +148,8 @@
     "city": "Ponneri",
     "state": "Tamil Nadu",
     "address": "Indo Space AS Industrial Park, Survey No.139-157/2, Durainallur Village, Puduvoyal Post, Ponneri, Thiruvallur 601206",
-    "lat": 13.327498,
-    "lng": 80.134769
+    "lat": 13.3271125,
+    "lng": 80.1357928
   },
   "MAA5": {
     "name": "Amazon FC MAA5",
@@ -164,8 +164,8 @@
     "city": "Pune",
     "state": "Maharashtra",
     "address": "Building No. B01, ESR Pune Estates Pvt Ltd, Village Ambethan, Tal-Khed, Pune 410501",
-    "lat": 18.840507,
-    "lng": 73.907187
+    "lat": 18.7935536,
+    "lng": 73.8057068
   },
   "AMD1": {
     "name": "Amazon FC AMD1",
