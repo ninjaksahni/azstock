@@ -18,5 +18,7 @@
     "MAA",
     "PNQ"
   ],
-  "excluded_warehouses": []
+  "excluded_warehouses": [
+    "BLR4"
+  ]
 }
