@@ -10,23 +10,7 @@
     "MT1": 15
   },
   "selected_cities": [
-    "BLR",
-    "BOM",
-    "CJB",
-    "DEL",
-    "HYD",
-    "MAA",
-    "PNQ"
+    "BLR"
   ],
-  "excluded_warehouses": [
-    "BLR4",
-    "BLR5",
-    "BOM1",
-    "BOM3",
-    "BOM4",
-    "BOM6",
-    "BOM9",
-    "DEL2",
-    "MAA5"
-  ]
+  "excluded_warehouses": []
 }
