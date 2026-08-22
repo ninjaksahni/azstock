@@ -70,6 +70,7 @@ DEFAULT_SETTINGS = {
     "sku_overrides": {},
     "selected_cities": [],
     "excluded_warehouses": [],
+    "filters_saved": False,
 }
 
 
@@ -173,6 +174,8 @@ def _merge_session_settings(settings: dict) -> dict:
 
 def _settings_payload(settings: dict) -> dict:
     merged = _merge_session_settings(settings)
+    if merged.get("selected_cities") or merged.get("excluded_warehouses"):
+        merged["filters_saved"] = True
     to_save = normalize_settings(merged)
     to_save.pop("selected_warehouses", None)
     # JSON keys must be strings for sku_overrides
@@ -213,8 +216,12 @@ def _merge_settings_sources(*sources: dict) -> dict:
             if key in ("selected_cities", "excluded_warehouses", "sku_overrides"):
                 if val:
                     merged[key] = val
+            elif key == "filters_saved":
+                merged[key] = bool(merged.get("filters_saved")) or bool(val)
             else:
                 merged[key] = val
+    if merged.get("selected_cities") or merged.get("excluded_warehouses"):
+        merged["filters_saved"] = True
     return normalize_settings(merged)
 
 
@@ -259,10 +266,11 @@ def load_settings(force_refresh: bool = False) -> dict:
 def refresh_settings_from_storage(
     agg: pd.DataFrame | None = None,
     source_key: str | None = None,
+    force: bool = False,
 ) -> dict:
     """Reload settings.json from disk/GitHub and apply to session + widgets."""
     refresh_key = source_key or "_default"
-    if st.session_state.get("_settings_applied_for") == refresh_key:
+    if not force and st.session_state.get("_settings_applied_for") == refresh_key:
         return st.session_state.settings
 
     settings = load_settings(force_refresh=True)
@@ -416,7 +424,7 @@ def _ensure_settings() -> dict:
 def bootstrap_settings(agg: pd.DataFrame | None = None) -> dict:
     """Load settings from disk/GitHub once per browser session and seed filter widgets."""
     if not st.session_state.get("_settings_bootstrapped"):
-        refresh_settings_from_storage(agg)
+        refresh_settings_from_storage(agg, force=True)
         st.session_state._settings_bootstrapped = True
     return st.session_state.settings
 
@@ -425,6 +433,7 @@ def _persist_city_filters(agg: pd.DataFrame | None = None) -> None:
     settings = _ensure_settings()
     cities = list(st.session_state.settings_selected_cities)
     settings["selected_cities"] = cities
+    settings["filters_saved"] = True
     wh_opts = set(warehouses_for_cities(cities, agg))
     excluded = list(
         st.session_state.get("settings_excluded_warehouses")
@@ -445,6 +454,7 @@ def _persist_excluded_warehouses(agg: pd.DataFrame | None = None) -> None:
     excluded = [wh for wh in st.session_state.settings_excluded_warehouses if wh in wh_opts]
     st.session_state.settings_excluded_warehouses = excluded
     settings["excluded_warehouses"] = excluded
+    settings["filters_saved"] = True
     st.session_state.settings = settings
     save_settings(settings)
 
@@ -841,14 +851,13 @@ def all_city_options(agg: pd.DataFrame | None = None) -> list[str]:
 
 def effective_selected_cities(settings: dict, agg: pd.DataFrame | None = None) -> list[str]:
     all_cities = all_city_options(agg)
+    if not settings.get("filters_saved"):
+        return all_cities
     selected = settings.get("selected_cities")
     if selected is None and settings.get("selected_warehouses"):
         selected = sorted({extract_city_code(wh) for wh in settings["selected_warehouses"]})
     selected = selected or []
-    if not selected:
-        return all_cities
-    filtered = [city for city in selected if city in all_cities]
-    return filtered or all_cities
+    return [city for city in selected if city in all_cities]
 
 
 def warehouses_for_cities(city_codes: list[str], agg: pd.DataFrame | None = None) -> list[str]:
@@ -2032,11 +2041,14 @@ def render_sidebar_context(
         st.markdown(f"**Ledger date:** {ledger_data_date}")
     cities = effective_selected_cities(settings, agg)
     enabled = effective_warehouses(settings, agg)
-    excluded = excluded_warehouses(settings)
-    st.markdown(f"**Cities enabled:** {len(cities)}")
-    st.markdown(f"**Warehouses enabled:** {len(enabled)}")
-    if excluded:
-        st.markdown(f"**Excluded FCs:** {len(excluded)}")
+    excluded = sorted(excluded_warehouses(settings))
+    city_labels = ", ".join(f"{city_display_name(c)} ({c})" for c in cities) or "none"
+    warehouse_labels = ", ".join(enabled) or "none"
+    excluded_labels = ", ".join(excluded) or "none"
+
+    st.markdown(f"**Cities enabled:** {city_labels}")
+    st.markdown(f"**Warehouses enabled:** {warehouse_labels}")
+    st.markdown(f"**Excluded:** {excluded_labels}")
     if st.button("Open settings", key="sidebar_open_settings"):
         st.session_state.jump_to_settings = True
         st.rerun()
@@ -2139,7 +2151,11 @@ def render_app(
     st.caption(f"Data source: **{source_label}**")
 
     # Apply persisted city/warehouse filters from storage for this dataset.
-    refresh_settings_from_storage(agg, source_key)
+    refresh_settings_from_storage(
+        agg,
+        source_key,
+        force=not st.session_state.settings.get("filters_saved"),
+    )
     settings = st.session_state.settings
     settings["scope"] = "per_city"
     agg, city_agg = apply_city_filter(agg, city_agg, settings)
@@ -2262,12 +2278,15 @@ if uploaded_file is not None and not st.session_state.get("prefer_history"):
         st.session_state.last_upload_sig = upload_sig
         st.session_state.save_decision_for = None
         st.session_state.prefer_history = False
+        st.session_state.pop("_settings_applied_for", None)
+        st.session_state.pop("_settings_cache", None)
     try:
         with st.spinner("Parsing ledger…"):
             df = _read_csv_safe(uploaded_file)
             ledger_data_date = extract_ledger_data_date(df)
             agg, city_agg, velocity = parse_ledger_csv(df)
         source_label = f"Upload · {uploaded_file.name}"
+        refresh_settings_from_storage(agg, upload_sig, force=True)
     except Exception as e:
         st.error(str(e))
         if "missing required columns" in str(e).lower():
