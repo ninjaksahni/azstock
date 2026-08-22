@@ -38,6 +38,8 @@ LOCATIONS_FILE = DATA_DIR / "warehouse_locations.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 HISTORY_FILE = DATA_DIR / "history.json"
 LIS_RADIUS_KM = 300
+LIS_ROAD_FACTOR = 1.25
+LIS_MAP_RADIUS_KM = LIS_RADIUS_KM / LIS_ROAD_FACTOR
 LIS_HEATMAP_COLORS = {
     1: "#c4b5fd",
     2: "#8b5cf6",
@@ -80,6 +82,13 @@ def lis_circle_color(loc: str) -> str:
     return LIS_CIRCLE_COLORS[sum(ord(c) for c in loc) % len(LIS_CIRCLE_COLORS)]
 
 
+def lis_map_radius_caption() -> str:
+    return (
+        f"LIS = {int(LIS_RADIUS_KM)} km road; "
+        f"circles drawn at {int(LIS_MAP_RADIUS_KM)} km (straight-line)."
+    )
+
+
 def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     radius_earth_km = 6371.0
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
@@ -92,7 +101,7 @@ def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
 @st.cache_data
 def compute_lis_coverage_layers(
     warehouse_coords: tuple[tuple[float, float], ...],
-    radius_km: float = LIS_RADIUS_KM,
+    radius_km: float = LIS_MAP_RADIUS_KM,
     resolution_deg: float = 0.08,
 ) -> dict[int, dict]:
     """Build merged LIS coverage polygons grouped by overlap count (1, 2, 3, 4+ FCs)."""
@@ -1481,13 +1490,16 @@ def build_warehouse_map(
                 lis_color = lis_circle_color(loc)
                 folium.Circle(
                     location=[lat, lng],
-                    radius=LIS_RADIUS_KM * 1000,
+                    radius=LIS_MAP_RADIUS_KM * 1000,
                     color=lis_color,
                     fill=True,
                     fill_color=lis_color,
                     fill_opacity=0.12,
                     weight=2,
-                    tooltip=f"{loc} — {LIS_RADIUS_KM} km LIS radius",
+                    tooltip=(
+                        f"{loc} — {int(LIS_MAP_RADIUS_KM)} km on map "
+                        f"({int(LIS_RADIUS_KM)} km road LIS)"
+                    ),
                 ).add_to(m)
 
             folium.CircleMarker(
@@ -2188,11 +2200,19 @@ def render_map_tab(agg: pd.DataFrame, settings: dict, alerts_data: dict) -> None
                 "Show Merged LIS Area",
                 value=False,
                 key="pref_show_merged_lis",
-                help="Merged 300 km LIS coverage for all enabled FCs. Darker = more overlapping warehouses.",
+                help=(
+                    "Merged LIS coverage for all enabled FCs (300 km road, 240 km on map). "
+                    "Darker violet = more overlapping warehouses."
+                ),
             )
         with opt3:
             if not show_merged_lis_area:
-                show_lis_radius = st.checkbox("SHOW LIS RADIUS", value=False, key="pref_show_lis_radius")
+                show_lis_radius = st.checkbox(
+                    "SHOW LIS RADIUS",
+                    value=False,
+                    key="pref_show_lis_radius",
+                    help="Per-FC circles: 300 km road LIS shown as 240 km straight-line on the map.",
+                )
 
     warehouse_map, unmapped = build_warehouse_map(
         agg,
@@ -2207,10 +2227,12 @@ def render_map_tab(agg: pd.DataFrame, settings: dict, alerts_data: dict) -> None
         satellite_view=satellite_view,
         settings=settings,
     )
+    if show_merged_lis_area or show_lis_radius:
+        st.caption(lis_map_radius_caption())
     if show_merged_lis_area:
         st.caption(
-            "LIS heatmap uses all enabled FCs from settings. "
-            "Light violet = 1 FC · darker violet = more overlapping 300 km coverage."
+            "Heatmap uses all enabled FCs from settings. "
+            "Light violet = 1 FC · darker violet = more overlapping coverage."
         )
     excluded = excluded_warehouses(settings)
     if excluded:
