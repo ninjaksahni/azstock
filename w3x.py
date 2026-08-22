@@ -37,7 +37,7 @@ LOCATIONS_FILE = DATA_DIR / "warehouse_locations.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 HISTORY_FILE = DATA_DIR / "history.json"
 LIS_RADIUS_KM = 300
-LIS_ROAD_FACTOR = 1.25
+LIS_ROAD_FACTOR = 1.35
 LIS_MAP_RADIUS_KM = LIS_RADIUS_KM / LIS_ROAD_FACTOR
 LIS_HEATMAP_COLORS = {
     1: "#a78bfa",
@@ -2223,7 +2223,8 @@ def render_map_tab(agg: pd.DataFrame, settings: dict, alerts_data: dict) -> None
                 value=False,
                 key="pref_show_merged_lis",
                 help=(
-                    "Merged LIS coverage for all enabled FCs (300 km road, 240 km on map). "
+                    f"Merged LIS coverage for all enabled FCs ({int(LIS_RADIUS_KM)} km road, "
+                    f"{int(LIS_MAP_RADIUS_KM)} km on map). "
                     "Darker violet = more overlapping warehouses."
                 ),
             )
@@ -2233,7 +2234,10 @@ def render_map_tab(agg: pd.DataFrame, settings: dict, alerts_data: dict) -> None
                     "SHOW LIS RADIUS",
                     value=False,
                     key="pref_show_lis_radius",
-                    help="Per-FC circles: 300 km road LIS shown as 240 km straight-line on the map.",
+                    help=(
+                        f"Per-FC circles: {int(LIS_RADIUS_KM)} km road LIS shown as "
+                        f"{int(LIS_MAP_RADIUS_KM)} km straight-line on the map."
+                    ),
                 )
 
     warehouse_map, unmapped = build_warehouse_map(
