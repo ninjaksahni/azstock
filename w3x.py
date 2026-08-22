@@ -13,7 +13,7 @@ import folium
 import numpy as np
 import pandas as pd
 import streamlit as st
-from shapely.geometry import box, mapping
+from shapely.geometry import box, mapping, Point, Polygon
 from streamlit_folium import st_folium
 
 st.set_page_config(page_title="Amazon Warehouse Stock", layout="wide")
@@ -88,6 +88,44 @@ def lis_map_radius_caption() -> str:
     )
 
 
+def offset_latlng(lat: float, lng: float, bearing_rad: float, distance_km: float) -> tuple[float, float]:
+    """Destination point on Earth given start, bearing, and distance (matches map geodesic circles)."""
+    earth_km = 6371.0
+    lat1, lng1 = math.radians(lat), math.radians(lng)
+    ang_dist = distance_km / earth_km
+    lat2 = math.asin(
+        math.sin(lat1) * math.cos(ang_dist)
+        + math.cos(lat1) * math.sin(ang_dist) * math.cos(bearing_rad)
+    )
+    lng2 = lng1 + math.atan2(
+        math.sin(bearing_rad) * math.sin(ang_dist) * math.cos(lat1),
+        math.cos(ang_dist) - math.sin(lat1) * math.sin(lat2),
+    )
+    return math.degrees(lat2), math.degrees(lng2)
+
+
+def lis_circle_polygon(lat: float, lng: float, radius_km: float, segments: int = 64) -> Polygon:
+    """Geodesic circle polygon using the same radius as folium LIS circles."""
+    ring = []
+    for i in range(segments):
+        bearing = 2 * math.pi * i / segments
+        p_lat, p_lng = offset_latlng(lat, lng, bearing, radius_km)
+        ring.append((p_lng, p_lat))
+    ring.append(ring[0])
+    return Polygon(ring)
+
+
+def lis_warehouse_entries(
+    locations_db: dict,
+    warehouse_codes: list[str],
+) -> tuple[tuple[str, float, float], ...]:
+    return tuple(
+        (loc, locations_db[loc]["lat"], locations_db[loc]["lng"])
+        for loc in warehouse_codes
+        if loc in locations_db
+    )
+
+
 def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     radius_earth_km = 6371.0
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
@@ -100,17 +138,22 @@ def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
 @st.cache_data
 def compute_lis_coverage_geojson(
     warehouse_entries: tuple[tuple[str, float, float], ...],
-    radius_km: float = LIS_MAP_RADIUS_KM,
+    map_radius_km: float,
+    road_factor: float,
     resolution_deg: float = 0.08,
 ) -> dict:
-    """GeoJSON grid of LIS coverage cells with warehouse lists for map hover."""
+    """GeoJSON grid built from the same geodesic LIS circles used on the map."""
     if not warehouse_entries:
         return {"type": "FeatureCollection", "features": []}
 
     entries = list(warehouse_entries)
+    circle_polys = [
+        (loc, lis_circle_polygon(lat, lng, map_radius_km))
+        for loc, lat, lng in entries
+    ]
     lats = [lat for _, lat, _ in entries]
     lngs = [lng for _, _, lng in entries]
-    margin = radius_km / 111.0 * 1.15
+    margin = map_radius_km / 111.0 * 1.15
     lat_min, lat_max = min(lats) - margin, max(lats) + margin
     lng_min, lng_max = min(lngs) - margin, max(lngs) + margin
 
@@ -124,10 +167,9 @@ def compute_lis_coverage_geojson(
         lat_c = (lat_steps[i] + lat_steps[i + 1]) / 2
         for j in range(len(lng_steps) - 1):
             lng_c = (lng_steps[j] + lng_steps[j + 1]) / 2
+            probe = Point(lng_c, lat_c)
             covering = [
-                loc
-                for loc, wh_lat, wh_lng in entries
-                if haversine_km(lat_c, lng_c, wh_lat, wh_lng) <= radius_km
+                loc for loc, poly in circle_polys if poly.covers(probe)
             ]
             if not covering:
                 continue
@@ -143,7 +185,10 @@ def compute_lis_coverage_geojson(
                         "level": level,
                         "count": count,
                         "warehouses": wh_list,
-                        "hover": f"{count} FC{'s' if count != 1 else ''}: {wh_list}",
+                        "hover": (
+                            f"{count} FC{'s' if count != 1 else ''}: {wh_list} · "
+                            f"{int(LIS_RADIUS_KM)} km road / {int(map_radius_km)} km map"
+                        ),
                     },
                 }
             )
@@ -1448,15 +1493,20 @@ def build_warehouse_map(
     else:
         m = folium.Map(location=INDIA_MAP_CENTER, zoom_start=INDIA_MAP_ZOOM, tiles="OpenStreetMap")
 
+    lis_map_radius_km = LIS_MAP_RADIUS_KM
+    lis_radius_m = lis_map_radius_km * 1000
+
     if show_merged_lis_area and settings:
-        lis_warehouses = effective_warehouses(settings, agg)
-        lis_entries = tuple(
-            (loc, locations_db[loc]["lat"], locations_db[loc]["lng"])
-            for loc in lis_warehouses
-            if loc in locations_db
+        lis_entries = lis_warehouse_entries(
+            locations_db,
+            effective_warehouses(settings, agg),
         )
         if lis_entries:
-            coverage_geojson = compute_lis_coverage_geojson(lis_entries)
+            coverage_geojson = compute_lis_coverage_geojson(
+                lis_entries,
+                lis_map_radius_km,
+                LIS_ROAD_FACTOR,
+            )
             add_merged_lis_layers(m, coverage_geojson)
 
     if mode == "All warehouses":
@@ -1512,14 +1562,14 @@ def build_warehouse_map(
                 lis_color = lis_circle_color(loc)
                 folium.Circle(
                     location=[lat, lng],
-                    radius=LIS_MAP_RADIUS_KM * 1000,
+                    radius=lis_radius_m,
                     color=lis_color,
                     fill=True,
                     fill_color=lis_color,
                     fill_opacity=0.12,
                     weight=2,
                     tooltip=(
-                        f"{loc} — {int(LIS_MAP_RADIUS_KM)} km on map "
+                        f"{loc} — {int(lis_map_radius_km)} km on map "
                         f"({int(LIS_RADIUS_KM)} km road LIS)"
                     ),
                 ).add_to(m)
