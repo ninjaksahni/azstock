@@ -2046,9 +2046,9 @@ def render_sidebar_context(
     warehouse_labels = ", ".join(enabled) or "none"
     excluded_labels = ", ".join(excluded) or "none"
 
-    st.markdown(f"**Cities enabled:** {city_labels}")
-    st.markdown(f"**Warehouses enabled:** {warehouse_labels}")
-    st.markdown(f"**Excluded:** {excluded_labels}")
+    st.markdown(f"**Cities enabled ({len(cities)}):** {city_labels}")
+    st.markdown(f"**Warehouses enabled ({len(enabled)}):** {warehouse_labels}")
+    st.markdown(f"**Excluded ({len(excluded)}):** {excluded_labels}")
     if st.button("Open settings", key="sidebar_open_settings"):
         st.session_state.jump_to_settings = True
         st.rerun()
