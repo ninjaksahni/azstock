@@ -14,7 +14,6 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from shapely.geometry import box, mapping
-from shapely.ops import unary_union
 from streamlit_folium import st_folium
 
 st.set_page_config(page_title="Amazon Warehouse Stock", layout="wide")
@@ -41,16 +40,16 @@ LIS_RADIUS_KM = 300
 LIS_ROAD_FACTOR = 1.25
 LIS_MAP_RADIUS_KM = LIS_RADIUS_KM / LIS_ROAD_FACTOR
 LIS_HEATMAP_COLORS = {
-    1: "#c4b5fd",
-    2: "#8b5cf6",
-    3: "#6d28d9",
-    4: "#4c1d95",
+    1: "#a78bfa",
+    2: "#7c3aed",
+    3: "#5b21b6",
+    4: "#3b0764",
 }
 LIS_HEATMAP_FILL_OPACITY = {
-    1: 0.14,
-    2: 0.20,
-    3: 0.26,
-    4: 0.32,
+    1: 0.30,
+    2: 0.42,
+    3: 0.52,
+    4: 0.62,
 }
 INDIA_MAP_CENTER = [22.0, 79.0]
 INDIA_MAP_ZOOM = 5
@@ -99,18 +98,18 @@ def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
 
 
 @st.cache_data
-def compute_lis_coverage_layers(
-    warehouse_coords: tuple[tuple[float, float], ...],
+def compute_lis_coverage_geojson(
+    warehouse_entries: tuple[tuple[str, float, float], ...],
     radius_km: float = LIS_MAP_RADIUS_KM,
     resolution_deg: float = 0.08,
-) -> dict[int, dict]:
-    """Build merged LIS coverage polygons grouped by overlap count (1, 2, 3, 4+ FCs)."""
-    if not warehouse_coords:
-        return {}
+) -> dict:
+    """GeoJSON grid of LIS coverage cells with warehouse lists for map hover."""
+    if not warehouse_entries:
+        return {"type": "FeatureCollection", "features": []}
 
-    coords = list(warehouse_coords)
-    lats = [lat for lat, _ in coords]
-    lngs = [lng for _, lng in coords]
+    entries = list(warehouse_entries)
+    lats = [lat for _, lat, _ in entries]
+    lngs = [lng for _, _, lng in entries]
     margin = radius_km / 111.0 * 1.15
     lat_min, lat_max = min(lats) - margin, max(lats) + margin
     lng_min, lng_max = min(lngs) - margin, max(lngs) + margin
@@ -118,44 +117,67 @@ def compute_lis_coverage_layers(
     lat_steps = np.arange(lat_min, lat_max + resolution_deg, resolution_deg)
     lng_steps = np.arange(lng_min, lng_max + resolution_deg, resolution_deg)
     if len(lat_steps) < 2 or len(lng_steps) < 2:
-        return {}
+        return {"type": "FeatureCollection", "features": []}
 
-    cell_polys: dict[int, list] = {}
+    features: list[dict] = []
     for i in range(len(lat_steps) - 1):
         lat_c = (lat_steps[i] + lat_steps[i + 1]) / 2
         for j in range(len(lng_steps) - 1):
             lng_c = (lng_steps[j] + lng_steps[j + 1]) / 2
-            coverage = 0
-            for wh_lat, wh_lng in coords:
-                if haversine_km(lat_c, lng_c, wh_lat, wh_lng) <= radius_km:
-                    coverage += 1
-            if coverage <= 0:
+            covering = [
+                loc
+                for loc, wh_lat, wh_lng in entries
+                if haversine_km(lat_c, lng_c, wh_lat, wh_lng) <= radius_km
+            ]
+            if not covering:
                 continue
-            level = min(coverage, 4)
-            cell_polys.setdefault(level, []).append(
-                box(lng_steps[j], lat_steps[i], lng_steps[j + 1], lat_steps[i + 1])
+            count = len(covering)
+            level = min(count, 4)
+            wh_list = ", ".join(sorted(covering))
+            cell = box(lng_steps[j], lat_steps[i], lng_steps[j + 1], lat_steps[i + 1])
+            features.append(
+                {
+                    "type": "Feature",
+                    "geometry": mapping(cell),
+                    "properties": {
+                        "level": level,
+                        "count": count,
+                        "warehouses": wh_list,
+                        "hover": f"{count} FC{'s' if count != 1 else ''}: {wh_list}",
+                    },
+                }
             )
 
-    layers: dict[int, dict] = {}
-    for level, polygons in cell_polys.items():
-        merged = unary_union(polygons)
-        if merged.is_empty:
-            continue
-        layers[level] = mapping(merged)
-    return layers
+    return {"type": "FeatureCollection", "features": features}
 
 
-def add_merged_lis_layers(map_obj: folium.Map, layers: dict[int, dict]) -> None:
-    for level in sorted(layers.keys()):
-        folium.GeoJson(
-            layers[level],
-            style_function=lambda _feature, lvl=level: {
-                "fillColor": LIS_HEATMAP_COLORS[lvl],
-                "color": LIS_HEATMAP_COLORS[lvl],
-                "weight": 0.6,
-                "fillOpacity": LIS_HEATMAP_FILL_OPACITY[lvl],
-            },
-        ).add_to(map_obj)
+def add_merged_lis_layers(map_obj: folium.Map, coverage_geojson: dict) -> None:
+    if not coverage_geojson.get("features"):
+        return
+
+    def _lis_style(feature: dict) -> dict:
+        level = feature["properties"]["level"]
+        color = LIS_HEATMAP_COLORS[level]
+        return {
+            "fillColor": color,
+            "color": color,
+            "weight": 1.0,
+            "fillOpacity": LIS_HEATMAP_FILL_OPACITY[level],
+        }
+
+    folium.GeoJson(
+        coverage_geojson,
+        style_function=lambda feature: _lis_style(feature),
+        highlight_function=lambda feature: {
+            "weight": 2.5,
+            "fillOpacity": min(LIS_HEATMAP_FILL_OPACITY[feature["properties"]["level"]] + 0.15, 0.85),
+        },
+        tooltip=folium.GeoJsonTooltip(
+            fields=["hover"],
+            labels=False,
+            sticky=True,
+        ),
+    ).add_to(map_obj)
 
 DEFAULT_SETTINGS = {
     "enabled": True,
@@ -1428,14 +1450,14 @@ def build_warehouse_map(
 
     if show_merged_lis_area and settings:
         lis_warehouses = effective_warehouses(settings, agg)
-        lis_coords = tuple(
-            (locations_db[loc]["lat"], locations_db[loc]["lng"])
+        lis_entries = tuple(
+            (loc, locations_db[loc]["lat"], locations_db[loc]["lng"])
             for loc in lis_warehouses
             if loc in locations_db
         )
-        if lis_coords:
-            coverage_layers = compute_lis_coverage_layers(lis_coords)
-            add_merged_lis_layers(m, coverage_layers)
+        if lis_entries:
+            coverage_geojson = compute_lis_coverage_geojson(lis_entries)
+            add_merged_lis_layers(m, coverage_geojson)
 
     if mode == "All warehouses":
         for _, row in loc_totals.iterrows():
@@ -2232,7 +2254,7 @@ def render_map_tab(agg: pd.DataFrame, settings: dict, alerts_data: dict) -> None
     if show_merged_lis_area:
         st.caption(
             "Heatmap uses all enabled FCs from settings. "
-            "Light violet = 1 FC · darker violet = more overlapping coverage."
+            "Hover for covering warehouses. Light violet = 1 FC · darker = more overlap."
         )
     excluded = excluded_warehouses(settings)
     if excluded:
