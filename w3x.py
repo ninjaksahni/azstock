@@ -503,7 +503,63 @@ def send_qty_store_key(source_key: str, view_mode: str) -> str:
 
 
 def suggested_send_qty(row: pd.Series) -> int:
+    if "Gap" in row.index and not pd.isna(row.get("Gap")):
+        return max(0, int(row["Gap"]))
     return max(0, int(row["Threshold"]) - int(row["Current"]))
+
+
+def send_plan_row_status(current: int, threshold: int, is_low: bool) -> str:
+    if current == 0:
+        return "ZERO"
+    if is_low:
+        return "LOW"
+    return "OK"
+
+
+def enrich_send_plan_rows(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    out = df.copy()
+    if "Shortfall" in out.columns:
+        out["Gap"] = out["Shortfall"].astype(int)
+    else:
+        out["Gap"] = out.apply(suggested_send_qty, axis=1)
+    out["Status"] = out.apply(
+        lambda r: send_plan_row_status(int(r["Current"]), int(r["Threshold"]), bool(r["_low"])),
+        axis=1,
+    )
+    return out
+
+
+def sku_needs_attention(sku_plan: pd.DataFrame) -> bool:
+    if sku_plan.empty:
+        return False
+    return bool(sku_plan["_low"].any()) or bool((sku_plan["Current"] == 0).any())
+
+
+def order_skus_for_send_plan(plan: pd.DataFrame, selected_skus: list[str], include_ok_skus: bool) -> list[str]:
+    ordered: list[tuple[int, str, str]] = []
+    for sku in selected_skus:
+        sku_plan = plan[plan["MSKU"].astype(str) == str(sku)]
+        if sku_plan.empty:
+            continue
+        if not include_ok_skus and not sku_needs_attention(sku_plan):
+            continue
+        total_gap = int(sku_plan["Shortfall"].sum()) if "Shortfall" in sku_plan.columns else 0
+        ordered.append((total_gap, str(sku), str(sku)))
+    ordered.sort(key=lambda item: (-item[0], item[2]))
+    return [sku for _, sku, _ in ordered]
+
+
+def warehouse_rows_for_sku(plan: pd.DataFrame, sku: str, show_all_locations: bool) -> pd.DataFrame:
+    view = plan[plan["MSKU"].astype(str) == str(sku)].copy()
+    if not show_all_locations:
+        view = view[view.apply(lambda r: send_plan_includes_row(r, "Warehouse"), axis=1)]
+    if view.empty:
+        return view
+    view = enrich_send_plan_rows(view)
+    view = view.sort_values(["Gap", "Current"], ascending=[False, True]).reset_index(drop=True)
+    return view
 
 
 def send_qty_is_blank(val) -> bool:
@@ -829,8 +885,10 @@ def format_export_date(value) -> str | None:
 
 def send_plan_export_columns(view_mode: str) -> list[str]:
     if view_mode == "City":
-        return ["Priority", "City", "MSKU", "Current", "Send qty", "Notes"]
-    return ["Priority", "City", "Warehouse", "MSKU", "Current", "Send qty", "Notes"]
+        return ["MSKU", "City", "Current", "Threshold", "Gap", "Status", "Send qty", "Notes"]
+    if view_mode == "By SKU":
+        return ["MSKU", "City", "Warehouse", "Current", "Threshold", "Gap", "Status", "Send qty", "Notes"]
+    return ["Priority", "City", "Warehouse", "MSKU", "Current", "Threshold", "Gap", "Status", "Send qty", "Notes"]
 
 
 def extract_ledger_data_date(df: pd.DataFrame) -> str | None:
@@ -1150,7 +1208,7 @@ def build_send_plan(agg: pd.DataFrame, settings: dict) -> pd.DataFrame:
 
 
 def aggregate_send_plan_by_city(plan: pd.DataFrame) -> pd.DataFrame:
-    """Roll warehouse rows up to city + MSKU for city-level send planning."""
+    """Roll warehouse rows up to city + MSKU; Gap is sum of per-FC shortfalls (threshold is per FC)."""
     if plan.empty:
         return plan.copy()
 
@@ -1159,26 +1217,31 @@ def aggregate_send_plan_by_city(plan: pd.DataFrame) -> pd.DataFrame:
         .agg(
             Current=("Current", "sum"),
             Threshold=("Threshold", "first"),
+            Gap=("Shortfall", "sum"),
             Send_qty=("Send qty", sum_send_qty),
+            FCs=("Warehouse", "nunique"),
         )
         .rename(columns={"Send_qty": "Send qty"})
     )
-    grouped["Shortfall"] = (grouped["Threshold"] - grouped["Current"]).clip(lower=0).astype(int)
+    grouped["Gap"] = grouped["Gap"].astype(int)
+    grouped["Shortfall"] = grouped["Gap"]
     grouped["Shortfall %"] = grouped.apply(
-        lambda r: round(r["Shortfall"] / r["Threshold"] * 100, 1)
-        if r["Threshold"] > 0
-        else (100.0 if r["Shortfall"] else 0.0),
+        lambda r: round(r["Gap"] / (r["Threshold"] * r["FCs"]) * 100, 1)
+        if r["Threshold"] > 0 and r["FCs"] > 0
+        else (100.0 if r["Gap"] else 0.0),
         axis=1,
     )
-    grouped["_low"] = grouped["Current"] <= grouped["Threshold"]
-    grouped = grouped.sort_values(["Shortfall %", "Shortfall"], ascending=[False, False]).reset_index(drop=True)
+    grouped["_low"] = grouped["Gap"] > 0
+    grouped["_zero"] = grouped["Current"] == 0
+    grouped = enrich_send_plan_rows(grouped)
+    grouped = grouped.sort_values(["Shortfall %", "Gap"], ascending=[False, False]).reset_index(drop=True)
     grouped.insert(0, "Priority", range(1, len(grouped) + 1))
     return grouped
 
 
 def send_plan_includes_row(row: pd.Series, view_mode: str) -> bool:
     if view_mode == "City":
-        return bool(row.get("_low", False))
+        return bool(row.get("_low", False)) or int(row.get("Gap", row.get("Shortfall", 0))) > 0
     if bool(row.get("_zero", False)):
         return True
     return bool(row.get("_low", False))
@@ -1861,10 +1924,10 @@ def prepare_send_plan_table(
 
     if view_mode == "City":
         view = aggregate_send_plan_by_city(view)
-        display_cols = ["Priority", "City", "MSKU", "Current", "Threshold", "Suggested", "Send qty"]
+        display_cols = ["Priority", "City", "MSKU", "Current", "Threshold", "Gap", "Status", "Send qty"]
     else:
         display_cols = [
-            "Priority", "City", "Warehouse", "MSKU", "Current", "Threshold", "Suggested", "Send qty"
+            "Priority", "City", "Warehouse", "MSKU", "Current", "Threshold", "Gap", "Status", "Send qty"
         ]
 
     if not show_all:
@@ -1873,7 +1936,7 @@ def prepare_send_plan_table(
     if view.empty:
         return view, display_cols
 
-    view["Suggested"] = view.apply(suggested_send_qty, axis=1)
+    view = enrich_send_plan_rows(view)
     if "Send qty" not in view.columns:
         view["Send qty"] = pd.NA
 
@@ -1884,16 +1947,126 @@ def prepare_send_plan_table(
     return view[display_cols].copy(), display_cols
 
 
+def send_plan_column_config(view_mode: str) -> dict:
+    config = {
+        "Priority": st.column_config.NumberColumn("Priority", disabled=True),
+        "City": st.column_config.TextColumn("City", disabled=True),
+        "MSKU": st.column_config.TextColumn("MSKU", disabled=True),
+        "Current": st.column_config.NumberColumn("Current", disabled=True),
+        "Threshold": st.column_config.NumberColumn("Threshold (per FC)", disabled=True),
+        "Gap": st.column_config.NumberColumn("Gap", disabled=True),
+        "Status": st.column_config.TextColumn("Status", disabled=True),
+        "Send qty": st.column_config.NumberColumn("Send qty", min_value=0, step=1),
+    }
+    if view_mode in {"Warehouse", "By SKU"}:
+        config["Warehouse"] = st.column_config.TextColumn("Warehouse", disabled=True)
+    return config
+
+
+def send_plan_destination_columns() -> list[str]:
+    return ["Warehouse", "City", "Current", "Threshold", "Gap", "Status", "Send qty"]
+
+
+def fill_send_qty_for_rows(rows: pd.DataFrame, qty_store: dict, zero_only: bool = False) -> None:
+    for _, row in rows.iterrows():
+        if zero_only and int(row["Current"]) != 0:
+            continue
+        qty_store[send_plan_row_key(row, "Warehouse")] = suggested_send_qty(row)
+
+
+def render_send_plan_sku_sections(
+    plan: pd.DataFrame,
+    selected_skus: list[str],
+    source_key: str,
+    show_all_locations: bool,
+    show_ok_skus: bool,
+) -> pd.DataFrame:
+    """SKU-first send plan: one expander per MSKU with warehouse destination rows."""
+    skus = order_skus_for_send_plan(plan, selected_skus, show_ok_skus)
+    if not skus:
+        return pd.DataFrame()
+
+    store_key = send_qty_store_key(source_key, "Warehouse")
+    qty_store: dict = st.session_state.setdefault(store_key, {})
+    edited_parts: list[pd.DataFrame] = []
+    dest_cols = send_plan_destination_columns()
+    column_config = send_plan_column_config("By SKU")
+
+    for sku in skus:
+        sku_plan = plan[plan["MSKU"].astype(str) == str(sku)]
+        threshold = int(sku_plan["Threshold"].iloc[0]) if not sku_plan.empty else 0
+        total_current = int(sku_plan["Current"].sum())
+        total_gap = int(sku_plan["Shortfall"].sum())
+        needs = sku_needs_attention(sku_plan)
+
+        table = warehouse_rows_for_sku(plan, sku, show_all_locations)
+        if table.empty:
+            continue
+
+        table = merge_send_qty_from_store(table, qty_store, "Warehouse")
+        table["Send qty"] = pd.to_numeric(table["Send qty"], errors="coerce")
+        planned_send = int(table["Send qty"].dropna().sum())
+
+        label = (
+            f"{sku} — {total_current:,} units · gap {total_gap:,} · "
+            f"threshold {threshold} per FC · planned send {planned_send:,}"
+        )
+        if needs:
+            label = f"⚠️ {label}"
+
+        with st.expander(label, expanded=needs):
+            fc1, fc2, fc3 = st.columns(3)
+            if fc1.button("Fill gap (this SKU)", key=f"send_fill_gap_sku_{sku}_{source_key}"):
+                fill_send_qty_for_rows(table, qty_store, zero_only=False)
+                st.session_state[store_key] = qty_store
+                st.rerun()
+            if fc2.button("Fill zeros only (this SKU)", key=f"send_fill_zero_sku_{sku}_{source_key}"):
+                fill_send_qty_for_rows(table, qty_store, zero_only=True)
+                st.session_state[store_key] = qty_store
+                st.rerun()
+            if fc3.button("Clear send qty (this SKU)", key=f"send_clear_sku_{sku}_{source_key}"):
+                for _, row in table.iterrows():
+                    qty_store.pop(send_plan_row_key(row, "Warehouse"), None)
+                st.session_state[store_key] = qty_store
+                st.rerun()
+
+            editor_key = f"send_plan_editor_sku_{source_key}_{sku}"
+            edited = st.data_editor(
+                table[dest_cols],
+                column_config=column_config,
+                hide_index=True,
+                use_container_width=True,
+                key=editor_key,
+            )
+            edited_for_store = edited.copy()
+            for col in ("MSKU", "CityCode", "Warehouse"):
+                if col in table.columns:
+                    edited_for_store[col] = table[col].values
+            persist_send_qty_to_store(table, edited_for_store, qty_store, "Warehouse")
+            st.session_state[store_key] = qty_store
+
+            export_part = edited.copy()
+            export_part.insert(0, "MSKU", sku)
+            edited_parts.append(export_part)
+
+    if not edited_parts:
+        return pd.DataFrame()
+    return pd.concat(edited_parts, ignore_index=True)
+
+
 def render_send_plan_tab(
     plan: pd.DataFrame,
     source_key: str,
     ledger_data_date: str | None = None,
 ) -> None:
     st.subheader("📋 Send Plan")
-    st.caption("Review low-stock lines and enter how many units you plan to send. Export matches the table row order below.")
+    st.caption(
+        "Plan replenishment **by SKU**: open each MSKU to see warehouse destinations, "
+        "current units, per-FC threshold, and gap. Threshold is **per fulfillment center**."
+    )
 
     all_skus = sorted(plan["MSKU"].astype(str).unique())
-    fc1, fc2, fc3 = st.columns([2, 1, 1])
+    fc1, fc2, fc3, fc4 = st.columns([2, 1.2, 1, 1])
     with fc1:
         selected_skus = st.multiselect(
             "SKUs to include",
@@ -1904,132 +2077,169 @@ def render_send_plan_tab(
         )
     with fc2:
         view_mode = st.radio(
-            "View by",
-            options=["City", "Warehouse"],
+            "Layout",
+            options=["By SKU", "Warehouse", "City"],
             index=0,
             horizontal=True,
             key=f"send_plan_view_{source_key}",
         )
     with fc3:
-        show_all = st.checkbox(
-            "Show all SKUs (including above threshold)",
+        show_all_locations = st.checkbox(
+            "Show all locations",
             value=False,
+            help="Include FCs that are above threshold (OK).",
             key=f"pref_send_plan_show_all_{source_key}",
+        )
+    with fc4:
+        show_ok_skus = st.checkbox(
+            "Show OK SKUs",
+            value=False,
+            help="Include MSKUs with no low or zero stock anywhere.",
+            key=f"pref_send_plan_show_ok_skus_{source_key}",
         )
 
     if not selected_skus:
         st.warning("Select at least one MSKU to include in the send plan.")
         return
 
-    display_cols = (
-        ["Priority", "City", "MSKU", "Current", "Threshold", "Suggested", "Send qty"]
-        if view_mode == "City"
-        else [
-            "Priority", "City", "Warehouse", "MSKU", "Current", "Threshold", "Suggested", "Send qty"
-        ]
+    store_key = send_qty_store_key(
+        source_key, "Warehouse" if view_mode == "By SKU" else view_mode
     )
-    sc1, sc2 = st.columns([2, 1])
-    with sc1:
-        sort_by = st.selectbox(
-            "Sort by",
-            options=display_cols,
-            index=0,
-            key=f"send_plan_sort_{view_mode.lower()}_{source_key}",
-        )
-    with sc2:
-        sort_asc = st.toggle(
-            "Ascending",
-            value=True,
-            key=f"send_plan_sort_asc_{view_mode.lower()}_{source_key}",
-        )
-
-    table, display_cols = prepare_send_plan_table(
-        plan, selected_skus, view_mode, show_all, sort_by, sort_asc
-    )
-    if table.empty:
-        st.info("No rows match your filters.")
-        return
-
-    store_key = send_qty_store_key(source_key, view_mode)
     qty_store: dict = st.session_state.setdefault(store_key, {})
-    table = merge_send_qty_from_store(table, qty_store, view_mode)
-    table["Send qty"] = pd.to_numeric(table["Send qty"], errors="coerce")
 
-    editor_key = f"send_plan_editor_{view_mode.lower()}_{source_key}"
     fill1, fill2, fill3, _ = st.columns([1, 1, 1, 2])
     with fill1:
-        if st.button("Fill send qty with gap", key=f"send_fill_gap_{view_mode}_{source_key}"):
-            for _, row in table.iterrows():
-                qty_store[send_plan_row_key(row, view_mode)] = suggested_send_qty(row)
+        if st.button("Fill gap (all visible)", key=f"send_fill_gap_{view_mode}_{source_key}"):
+            if view_mode == "By SKU":
+                for sku in order_skus_for_send_plan(plan, selected_skus, show_ok_skus):
+                    rows = warehouse_rows_for_sku(plan, sku, show_all_locations)
+                    fill_send_qty_for_rows(rows, qty_store, zero_only=False)
+            else:
+                table, _ = prepare_send_plan_table(
+                    plan, selected_skus, view_mode, show_all_locations, "Priority", True
+                )
+                key_mode = "City" if view_mode == "City" else "Warehouse"
+                for _, row in table.iterrows():
+                    qty_store[send_plan_row_key(row, key_mode)] = suggested_send_qty(row)
             st.session_state[store_key] = qty_store
-            st.session_state.pop(editor_key, None)
             st.rerun()
     with fill2:
-        if st.button("Fill zeros only", key=f"send_fill_zero_{view_mode}_{source_key}"):
-            for _, row in table.iterrows():
-                if int(row["Current"]) == 0:
-                    qty_store[send_plan_row_key(row, view_mode)] = suggested_send_qty(row)
+        if st.button("Fill zeros only (all visible)", key=f"send_fill_zero_{view_mode}_{source_key}"):
+            if view_mode == "By SKU":
+                for sku in order_skus_for_send_plan(plan, selected_skus, show_ok_skus):
+                    rows = warehouse_rows_for_sku(plan, sku, show_all_locations)
+                    fill_send_qty_for_rows(rows, qty_store, zero_only=True)
+            else:
+                table, _ = prepare_send_plan_table(
+                    plan, selected_skus, view_mode, show_all_locations, "Priority", True
+                )
+                key_mode = "City" if view_mode == "City" else "Warehouse"
+                for _, row in table.iterrows():
+                    if int(row["Current"]) == 0:
+                        qty_store[send_plan_row_key(row, key_mode)] = suggested_send_qty(row)
             st.session_state[store_key] = qty_store
-            st.session_state.pop(editor_key, None)
             st.rerun()
     with fill3:
-        if st.button("Clear send quantities", key=f"send_clear_{view_mode}_{source_key}"):
+        if st.button("Clear all send quantities", key=f"send_clear_{view_mode}_{source_key}"):
             st.session_state[store_key] = {}
-            st.session_state.pop(editor_key, None)
             st.rerun()
 
-    column_config = {
-        "Priority": st.column_config.NumberColumn("Priority", disabled=True),
-        "City": st.column_config.TextColumn("City", disabled=True),
-        "MSKU": st.column_config.TextColumn("MSKU", disabled=True),
-        "Current": st.column_config.NumberColumn("Current", disabled=True),
-        "Threshold": st.column_config.NumberColumn("Threshold", disabled=True),
-        "Suggested": st.column_config.NumberColumn("Suggested", disabled=True),
-        "Send qty": st.column_config.NumberColumn("Send qty", min_value=0, step=1),
-    }
-    if view_mode == "Warehouse":
-        column_config["Warehouse"] = st.column_config.TextColumn("Warehouse", disabled=True)
+    if view_mode == "By SKU":
+        edited = render_send_plan_sku_sections(
+            plan, selected_skus, source_key, show_all_locations, show_ok_skus
+        )
+        if edited.empty:
+            st.info("No rows match your filters. Try enabling **Show OK SKUs** or **Show all locations**.")
+            return
+        export_view_mode = "By SKU"
+    else:
+        flat_mode = view_mode
+        display_cols = (
+            ["Priority", "City", "MSKU", "Current", "Threshold", "Gap", "Status", "Send qty"]
+            if flat_mode == "City"
+            else [
+                "Priority", "City", "Warehouse", "MSKU", "Current", "Threshold", "Gap", "Status", "Send qty"
+            ]
+        )
+        sc1, sc2 = st.columns([2, 1])
+        with sc1:
+            sort_by = st.selectbox(
+                "Sort by",
+                options=display_cols,
+                index=0,
+                key=f"send_plan_sort_{flat_mode.lower()}_{source_key}",
+            )
+        with sc2:
+            sort_asc = st.toggle(
+                "Ascending",
+                value=True,
+                key=f"send_plan_sort_asc_{flat_mode.lower()}_{source_key}",
+            )
 
-    edited = st.data_editor(
-        table,
-        column_config=column_config,
-        hide_index=True,
-        use_container_width=True,
-        key=editor_key,
-    )
-    persist_send_qty_to_store(table, edited, qty_store, view_mode)
-    st.session_state[store_key] = qty_store
+        table, display_cols = prepare_send_plan_table(
+            plan, selected_skus, flat_mode, show_all_locations, sort_by, sort_asc
+        )
+        if table.empty:
+            st.info("No rows match your filters.")
+            return
+
+        key_mode = "City" if flat_mode == "City" else "Warehouse"
+        table = merge_send_qty_from_store(table, qty_store, key_mode)
+        table["Send qty"] = pd.to_numeric(table["Send qty"], errors="coerce")
+
+        editor_key = f"send_plan_editor_{flat_mode.lower()}_{source_key}"
+        edited = st.data_editor(
+            table,
+            column_config=send_plan_column_config(flat_mode),
+            hide_index=True,
+            use_container_width=True,
+            key=editor_key,
+        )
+        persist_send_qty_to_store(table, edited, qty_store, key_mode)
+        st.session_state[store_key] = qty_store
+        export_view_mode = flat_mode
 
     total_send = int(edited["Send qty"].dropna().sum())
-    st.caption(f"**Total send qty:** {total_send:,} units")
+    st.caption(f"**Total planned send:** {total_send:,} units across visible rows")
 
-    export_cols = send_plan_export_columns(view_mode)
-    export_df = edited[[c for c in export_cols if c != "Notes"]].copy()
+    export_cols = send_plan_export_columns(export_view_mode)
+    export_df = edited.copy()
+    for col in export_cols:
+        if col not in export_df.columns and col != "Notes":
+            export_df[col] = ""
+    export_df = export_df[[c for c in export_cols if c != "Notes"]]
     export_df["Send qty"] = export_df["Send qty"].apply(
         lambda x: "" if send_qty_is_blank(x) else int(x)
     )
     export_df["Notes"] = ""
+    export_df = export_df.sort_values(
+        ["MSKU", "Gap", "Current"],
+        ascending=[True, False, True],
+        kind="mergesort",
+    ).reset_index(drop=True)
 
     export_date = format_export_date(ledger_data_date) or format_export_date(datetime.now())
     export_meta = [
         f"Exported: {format_export_date(datetime.now())}",
-        f"View: {view_mode}",
+        f"View: {export_view_mode}",
         f"SKUs: {', '.join(selected_skus)}",
+        "Threshold: per fulfillment center",
     ]
     if export_date:
         export_meta.append(f"Ledger data date: {export_date}")
 
-    footer = (
-        ["TOTAL", "", "", "", str(total_send), ""]
-        if view_mode == "City"
-        else ["TOTAL", "", "", "", "", str(total_send), ""]
-    )
+    footer = [""] * len(export_cols)
+    footer[0] = "TOTAL"
+    if "Send qty" in export_cols:
+        footer[export_cols.index("Send qty")] = str(total_send)
+    footer[-1] = ""
 
+    slug = export_view_mode.lower().replace(" ", "_")
     date_slug = export_date.replace(" ", "_") if export_date else datetime.now().strftime("%d_%B_%Y")
     st.download_button(
         label="⬇️ Export send plan CSV",
         data=export_csv_with_metadata(export_df[export_cols], export_meta, footer=footer),
-        file_name=f"send_plan_{view_mode.lower()}_{date_slug}.csv",
+        file_name=f"send_plan_{slug}_{date_slug}.csv",
         mime="text/csv",
     )
 
