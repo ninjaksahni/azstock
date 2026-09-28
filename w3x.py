@@ -718,7 +718,7 @@ def parse_ledger_csv(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
     required = {
         "msku": "MSKU",
         "disposition": "Disposition",
-        "balance": "Starting Warehouse Balance",
+        "balance": "Ending Warehouse Balance",
         "location": "Location",
     }
     found = {
@@ -753,7 +753,7 @@ def parse_ledger_csv(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
 
     df_sellable = df[df[disp_col].isin({"SELLABLE"}) & (df[bal_col] > 0)].copy()
     if df_sellable.empty:
-        raise ValueError("No SELLABLE items with a positive starting balance found.")
+        raise ValueError("No SELLABLE items with a positive balance found.")
 
     group_cols = [loc_col, msku_col]
     agg_parts = {bal_col: "sum"}
@@ -2200,7 +2200,7 @@ def render_overview_tab(
         "⬇️ Download aggregated CSV",
         data=export_csv_with_metadata(
             filtered_agg,
-            [f"Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", "Section: Aggregated current units by location (starting balance)"],
+            [f"Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", "Section: Aggregated current units by location (ending balance)"],
         ),
         file_name="aggregated_sellable_by_location_msku.csv",
         mime="text/csv",
@@ -2504,7 +2504,7 @@ if uploaded_file is not None and not st.session_state.get("prefer_history"):
             st.info(
                 "Download the report from "
                 "[Seller Central Ledger](https://sellercentral.amazon.in/reportcentral/LEDGER_REPORT/1) "
-                "and ensure it includes MSKU, Disposition, Starting Warehouse Balance, and Location columns."
+                "and ensure it includes MSKU, Disposition, Ending Warehouse Balance, and Location columns."
             )
         st.stop()
 
