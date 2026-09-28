@@ -33,6 +33,7 @@ CITY_NAMES = {
 }
 
 DATA_DIR = Path(__file__).parent / "data"
+STOCK_QTY_COL = "Current Units"
 LOCATIONS_FILE = DATA_DIR / "warehouse_locations.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 HISTORY_FILE = DATA_DIR / "history.json"
@@ -658,7 +659,7 @@ def make_snapshot(agg: pd.DataFrame, ledger_data_date: str | None = None) -> dic
             "Location": row["Location"],
             "CityCode": row["CityCode"],
             "MSKU": str(row["MSKU"]),
-            "sellable": int(row["Ending Warehouse Balance"]),
+            "sellable": int(row[STOCK_QTY_COL]),
         }
         if has_transit:
             rec["in_transit"] = int(row["In Transit Between Warehouses"])
@@ -672,7 +673,7 @@ def make_snapshot(agg: pd.DataFrame, ledger_data_date: str | None = None) -> dic
         "summary": {
             "warehouses": int(agg["Location"].nunique()),
             "mskus": int(agg["MSKU"].nunique()),
-            "total_sellable": int(agg["Ending Warehouse Balance"].sum()),
+            "total_sellable": int(agg[STOCK_QTY_COL].sum()),
             "total_in_transit": int(agg["In Transit Between Warehouses"].sum()) if has_transit else 0,
         },
     }
@@ -700,11 +701,11 @@ def get_snapshot(snapshot_id: str) -> dict | None:
 
 def agg_from_snapshot(snapshot: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
     df = pd.DataFrame(snapshot["records"])
-    rename = {"sellable": "Ending Warehouse Balance"}
+    rename = {"sellable": STOCK_QTY_COL}
     if "in_transit" in df.columns:
         rename["in_transit"] = "In Transit Between Warehouses"
     agg = df.rename(columns=rename)
-    city_parts = {"Ending Warehouse Balance": "sum"}
+    city_parts = {STOCK_QTY_COL: "sum"}
     if "In Transit Between Warehouses" in agg.columns:
         city_parts["In Transit Between Warehouses"] = "sum"
     city_agg = agg.groupby(["CityCode", "MSKU"], as_index=False).agg(city_parts)
@@ -717,7 +718,7 @@ def parse_ledger_csv(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
     required = {
         "msku": "MSKU",
         "disposition": "Disposition",
-        "balance": "Ending Warehouse Balance",
+        "balance": "Starting Warehouse Balance",
         "location": "Location",
     }
     found = {
@@ -752,7 +753,7 @@ def parse_ledger_csv(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
 
     df_sellable = df[df[disp_col].isin({"SELLABLE"}) & (df[bal_col] > 0)].copy()
     if df_sellable.empty:
-        raise ValueError("No SELLABLE items with a positive balance found.")
+        raise ValueError("No SELLABLE items with a positive starting balance found.")
 
     group_cols = [loc_col, msku_col]
     agg_parts = {bal_col: "sum"}
@@ -760,7 +761,7 @@ def parse_ledger_csv(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
         agg_parts[transit_col] = "sum"
 
     agg = df_sellable.groupby(group_cols, as_index=False).agg(agg_parts)
-    rename_map = {loc_col: "Location", msku_col: "MSKU", bal_col: "Ending Warehouse Balance"}
+    rename_map = {loc_col: "Location", msku_col: "MSKU", bal_col: STOCK_QTY_COL}
     if transit_col:
         rename_map[transit_col] = "In Transit Between Warehouses"
     agg.rename(columns=rename_map, inplace=True)
@@ -776,7 +777,7 @@ def parse_ledger_csv(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
         velocity = vel
 
     agg["CityCode"] = agg["Location"].apply(extract_city_code)
-    city_agg_parts = {"Ending Warehouse Balance": "sum"}
+    city_agg_parts = {STOCK_QTY_COL: "sum"}
     if "In Transit Between Warehouses" in agg.columns:
         city_agg_parts["In Transit Between Warehouses"] = "sum"
     city_agg = agg.groupby(["CityCode", "MSKU"], as_index=False).agg(city_agg_parts)
@@ -887,7 +888,7 @@ def compute_low_stock_alerts(agg: pd.DataFrame, settings: dict) -> dict:
     for _, row in expanded.iterrows():
         loc = row["Location"]
         msku = str(row["MSKU"])
-        qty = int(row["Ending Warehouse Balance"])
+        qty = int(row[STOCK_QTY_COL])
         thresh = threshold_for_msku(msku, settings)
         if qty <= thresh:
             flagged_skus.add((loc, msku))
@@ -942,9 +943,9 @@ def is_sku_flagged_in_city(
 
 def build_sku_threshold_table(agg: pd.DataFrame, settings: dict) -> pd.DataFrame:
     totals = (
-        agg.groupby("MSKU", as_index=False)["Ending Warehouse Balance"]
+        agg.groupby("MSKU", as_index=False)[STOCK_QTY_COL]
         .sum()
-        .rename(columns={"Ending Warehouse Balance": "Total Stock"})
+        .rename(columns={STOCK_QTY_COL: "Total Stock"})
     )
     totals["MSKU"] = totals["MSKU"].astype(str)
     totals["Threshold"] = totals["MSKU"].apply(lambda m: threshold_for_msku(m, settings))
@@ -968,7 +969,7 @@ def build_scope_status_table(agg: pd.DataFrame, settings: dict) -> pd.DataFrame:
 
         if scope == "per_warehouse":
             for loc, grp in msku_rows.groupby("Location"):
-                qty = int(grp["Ending Warehouse Balance"].sum())
+                qty = int(grp[STOCK_QTY_COL].sum())
                 rows.append(
                     {
                         "MSKU": msku,
@@ -980,7 +981,7 @@ def build_scope_status_table(agg: pd.DataFrame, settings: dict) -> pd.DataFrame:
                 )
         else:
             for city, grp in msku_rows.groupby("CityCode"):
-                qty = int(grp["Ending Warehouse Balance"].sum())
+                qty = int(grp[STOCK_QTY_COL].sum())
                 rows.append(
                     {
                         "MSKU": msku,
@@ -1049,7 +1050,7 @@ def effective_warehouses(settings: dict, agg: pd.DataFrame | None = None) -> lis
 def recompute_city_agg(agg: pd.DataFrame) -> pd.DataFrame:
     if agg.empty:
         return agg.copy()
-    city_parts = {"Ending Warehouse Balance": "sum"}
+    city_parts = {STOCK_QTY_COL: "sum"}
     if "In Transit Between Warehouses" in agg.columns:
         city_parts["In Transit Between Warehouses"] = "sum"
     return agg.groupby(["CityCode", "MSKU"], as_index=False).agg(city_parts)
@@ -1074,7 +1075,7 @@ def apply_city_filter(
 def expand_city_warehouse_stock(agg: pd.DataFrame, settings: dict | None = None) -> pd.DataFrame:
     """Selected cities' FCs × all MSKUs present in the upload, zero-filled where absent."""
     stock = (
-        agg.groupby(["Location", "CityCode", "MSKU"], as_index=False)["Ending Warehouse Balance"]
+        agg.groupby(["Location", "CityCode", "MSKU"], as_index=False)[STOCK_QTY_COL]
         .sum()
     )
     stock["MSKU"] = stock["MSKU"].astype(str)
@@ -1098,13 +1099,13 @@ def expand_city_warehouse_stock(agg: pd.DataFrame, settings: dict | None = None)
         city = wh["CityCode"]
         for msku in all_mskus:
             match = stock[(stock["Location"] == loc) & (stock["MSKU"] == msku)]
-            qty = int(match["Ending Warehouse Balance"].iloc[0]) if not match.empty else 0
+            qty = int(match[STOCK_QTY_COL].iloc[0]) if not match.empty else 0
             rows.append(
                 {
                     "Location": loc,
                     "CityCode": city,
                     "MSKU": msku,
-                    "Ending Warehouse Balance": qty,
+                    STOCK_QTY_COL: qty,
                 }
             )
 
@@ -1120,7 +1121,7 @@ def build_send_plan(agg: pd.DataFrame, settings: dict) -> pd.DataFrame:
         loc = row["Location"]
         city = row["CityCode"]
         msku = str(row["MSKU"])
-        current = int(row["Ending Warehouse Balance"])
+        current = int(row[STOCK_QTY_COL])
         threshold = threshold_for_msku(msku, settings)
         shortfall = max(0, threshold - current)
         shortfall_pct = (shortfall / threshold * 100) if threshold > 0 else (100.0 if shortfall else 0.0)
@@ -1224,7 +1225,7 @@ def overview_warehouse_table(plan: pd.DataFrame) -> pd.DataFrame:
 
 def city_overview_metrics(city_code: str, send_plan: pd.DataFrame, city_agg: pd.DataFrame) -> dict:
     city_stock = int(
-        city_agg.loc[city_agg["CityCode"] == city_code, "Ending Warehouse Balance"].sum()
+        city_agg.loc[city_agg["CityCode"] == city_code, STOCK_QTY_COL].sum()
     )
     city_plan = send_plan[send_plan["CityCode"] == city_code]
     low = city_plan[city_plan["_low"]] if not city_plan.empty else city_plan
@@ -1242,16 +1243,16 @@ def _sku_table_html(
     is_city: bool,
     scope: str,
 ) -> str:
-    rows = agg_slice.sort_values("Ending Warehouse Balance", ascending=False)
+    rows = agg_slice.sort_values(STOCK_QTY_COL, ascending=False)
     lines = [
         "<table style='font-size:12px;border-collapse:collapse;width:100%'>",
         "<tr><th style='text-align:left;padding:2px 6px'>MSKU</th>"
-        "<th style='text-align:right;padding:2px 6px'>Sellable</th>"
+        "<th style='text-align:right;padding:2px 6px'>Units</th>"
         "<th style='padding:2px 6px'>Alert</th></tr>",
     ]
     for _, r in rows.iterrows():
         msku = str(r["MSKU"])
-        qty = int(r["Ending Warehouse Balance"])
+        qty = int(r[STOCK_QTY_COL])
         if is_city:
             if scope == "per_city":
                 flagged = (scope_key, msku) in alerts_data["flagged_skus"]
@@ -1320,7 +1321,7 @@ def _alerts_for_city(city_code: str, agg: pd.DataFrame, alerts_data: dict) -> li
         str(msku): int(qty)
         for msku, qty in (
             agg[agg["CityCode"] == city_code]
-            .groupby("MSKU")["Ending Warehouse Balance"]
+            .groupby("MSKU")[STOCK_QTY_COL]
             .sum()
             .items()
         )
@@ -1369,32 +1370,32 @@ tr:nth-child(even){background:#f5f8fc}
     html += "<h2>Units Per SKU Per City</h2>"
     for city_code, grp in city_agg.groupby("CityCode"):
         name = city_display_name(city_code)
-        total = int(grp["Ending Warehouse Balance"].sum())
+        total = int(grp[STOCK_QTY_COL].sum())
         html += f"<h3>{name} ({city_code}) — {total} units</h3>"
         rows = [
-            [r["MSKU"], int(r["Ending Warehouse Balance"])]
-            for _, r in grp.sort_values("Ending Warehouse Balance", ascending=False).iterrows()
+            [r["MSKU"], int(r[STOCK_QTY_COL])]
+            for _, r in grp.sort_values(STOCK_QTY_COL, ascending=False).iterrows()
         ]
         html += tbl(["MSKU", "Units"], rows)
 
     html += "<h2>Stock By Warehouse</h2>"
     for location, grp in agg_df.groupby("Location"):
-        total = int(grp["Ending Warehouse Balance"].sum())
+        total = int(grp[STOCK_QTY_COL].sum())
         transit = (
             int(grp["In Transit Between Warehouses"].sum())
             if "In Transit Between Warehouses" in grp.columns
             else 0
         )
-        html += f"<h3>{location} — {total} sellable · {transit} in transit</h3>"
+        html += f"<h3>{location} — {total} units · {transit} in transit</h3>"
         rows = [
             [
                 r["MSKU"],
                 int(r.get("In Transit Between Warehouses", 0)),
-                int(r["Ending Warehouse Balance"]),
+                int(r[STOCK_QTY_COL]),
             ]
-            for _, r in grp.sort_values("Ending Warehouse Balance", ascending=False).iterrows()
+            for _, r in grp.sort_values(STOCK_QTY_COL, ascending=False).iterrows()
         ]
-        html += tbl(["MSKU", "In Transit", "Sellable Units"], rows, "#555")
+        html += tbl(["MSKU", "In Transit", "Current Units"], rows, "#555")
 
     html += "</body></html>"
     return html.encode("utf-8")
@@ -1434,9 +1435,9 @@ def _location_has_alerts(loc: str, city_code: str, alerts_data: dict) -> bool:
 
 def _location_totals(agg: pd.DataFrame) -> pd.DataFrame:
     totals = (
-        agg.groupby("Location", as_index=False)["Ending Warehouse Balance"]
+        agg.groupby("Location", as_index=False)[STOCK_QTY_COL]
         .sum()
-        .rename(columns={"Ending Warehouse Balance": "sellable"})
+        .rename(columns={STOCK_QTY_COL: "sellable"})
     )
     totals["CityCode"] = totals["Location"].apply(extract_city_code)
     return totals
@@ -1531,7 +1532,7 @@ def build_warehouse_map(
             alert_table = _map_alert_table_html(alert_rows)
             sku_table = _sku_table_html(
                 agg[agg["Location"] == loc].groupby("MSKU", as_index=False)[
-                    "Ending Warehouse Balance"
+                    STOCK_QTY_COL
                 ].sum(),
                 alerts_data,
                 loc,
@@ -1547,14 +1548,14 @@ def build_warehouse_map(
                 f"<b>{loc}</b><br>"
                 f"{meta.get('address', '')}<br>"
                 f"{meta.get('city', '')}, {meta.get('state', '')}<br>"
-                f"<b>Sellable:</b> {sellable:,}"
+                f"<b>Current units:</b> {sellable:,}"
                 f"{alert_block}"
                 f"<br><br><b>All SKUs:</b><br>{sku_table}"
             )
             color = "#d9534f" if is_low else "#2c6fad"
             fill = "#e74c3c" if is_low else "#4a90d9"
             radius = 13 if is_low else 10
-            tooltip = f"{loc} — {sellable:,} sellable"
+            tooltip = f"{loc} — {sellable:,} units"
             if alert_n:
                 tooltip += f" · ⚠️ {alert_n} alert{'s' if alert_n != 1 else ''}"
 
@@ -1614,7 +1615,7 @@ def build_warehouse_map(
 
             city_sku = (
                 agg[agg["CityCode"] == city_code]
-                .groupby("MSKU", as_index=False)["Ending Warehouse Balance"]
+                .groupby("MSKU", as_index=False)[STOCK_QTY_COL]
                 .sum()
             )
             sku_table = _sku_table_html(city_sku, alerts_data, city_code, is_city=True, scope=scope)
@@ -1628,14 +1629,14 @@ def build_warehouse_map(
             popup_html = (
                 f"<b>{city_name}</b> ({city_code})<br>"
                 f"<b>Warehouses ({fc_count}):</b> {wh_list}<br>"
-                f"<b>Sellable:</b> {total_sellable:,}"
+                f"<b>Current units:</b> {total_sellable:,}"
                 f"{alert_block}"
                 f"<br><br><b>All SKUs (city total):</b><br>{sku_table}"
             )
             color = "#d9534f" if is_low else "#1a3e6e"
             fill = "#e74c3c" if is_low else "#2c6fad"
             radius = 16 if is_low else 14
-            tooltip = f"{city_name} — {total_sellable:,} sellable ({fc_count} warehouses)"
+            tooltip = f"{city_name} — {total_sellable:,} units ({fc_count} warehouses)"
             if alert_n:
                 tooltip += f" · ⚠️ {alert_n} alert{'s' if alert_n != 1 else ''}"
 
@@ -2070,7 +2071,7 @@ def render_overview_tab(
     )
     total_cities = int(filtered_city_agg["CityCode"].nunique()) if not filtered_city_agg.empty else 0
     total_warehouses = int(filtered_agg["Location"].nunique()) if not filtered_agg.empty else 0
-    total_sellable = int(filtered_agg["Ending Warehouse Balance"].sum()) if not filtered_agg.empty else 0
+    total_sellable = int(filtered_agg[STOCK_QTY_COL].sum()) if not filtered_agg.empty else 0
     summary = send_plan_summary(plan)
     flagged_cities = (
         set(plan.loc[plan["_low"], "CityCode"].unique()) if not plan.empty and "_low" in plan.columns else set()
@@ -2087,7 +2088,7 @@ def render_overview_tab(
         st.success("All warehouse × MSKU lines are above threshold.")
 
     k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Total sellable", total_sellable)
+    k1.metric("Current units", total_sellable)
     k2.metric("In transit", total_in_transit)
     k3.metric("Cities flagged", summary["cities"])
     k4.metric("Warehouses flagged", summary["warehouses"])
@@ -2140,7 +2141,7 @@ def render_overview_tab(
         st.info("No city stock for the selected SKUs.")
     else:
         city_order = (
-            filtered_city_agg.groupby("CityCode")["Ending Warehouse Balance"]
+            filtered_city_agg.groupby("CityCode")[STOCK_QTY_COL]
             .sum()
             .sort_values(ascending=False)
         )
@@ -2199,7 +2200,7 @@ def render_overview_tab(
         "⬇️ Download aggregated CSV",
         data=export_csv_with_metadata(
             filtered_agg,
-            [f"Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", "Section: Aggregated sellable by location"],
+            [f"Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", "Section: Aggregated current units by location (starting balance)"],
         ),
         file_name="aggregated_sellable_by_location_msku.csv",
         mime="text/csv",
@@ -2503,7 +2504,7 @@ if uploaded_file is not None and not st.session_state.get("prefer_history"):
             st.info(
                 "Download the report from "
                 "[Seller Central Ledger](https://sellercentral.amazon.in/reportcentral/LEDGER_REPORT/1) "
-                "and ensure it includes MSKU, Disposition, Ending Warehouse Balance, and Location columns."
+                "and ensure it includes MSKU, Disposition, Starting Warehouse Balance, and Location columns."
             )
         st.stop()
 
