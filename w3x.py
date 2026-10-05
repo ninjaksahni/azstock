@@ -1126,9 +1126,9 @@ def parse_ledger_csv(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
     df[disp_col] = df[disp_col].astype(str).str.strip().str.upper()
     df[loc_col] = df[loc_col].fillna("Unknown")
 
-    df_sellable = df[df[disp_col].isin({"SELLABLE"}) & (df[bal_col] > 0)].copy()
+    df_sellable = df[df[disp_col].isin({"SELLABLE"})].copy()
     if df_sellable.empty:
-        raise ValueError("No SELLABLE items with a positive balance found.")
+        raise ValueError("No SELLABLE items found in the ledger.")
 
     group_cols = [loc_col, msku_col]
     agg_parts = {bal_col: "sum"}
@@ -1256,6 +1256,16 @@ def threshold_for_msku(msku: str, settings: dict) -> int:
     """Minimum stock target for an MSKU in a single city (summed across FCs in that city)."""
     overrides = settings.get("sku_overrides") or {}
     return int(overrides.get(str(msku).strip(), settings.get("global_threshold", 10)))
+
+
+def send_plan_msku_list(agg: pd.DataFrame, settings: dict | None) -> list[str]:
+    """MSKUs to show in send plan: ledger upload plus any configured overrides."""
+    mskus: set[str] = set()
+    if agg is not None and not agg.empty:
+        mskus.update(agg["MSKU"].astype(str).unique())
+    if settings:
+        mskus.update(str(k).strip() for k in (settings.get("sku_overrides") or {}))
+    return sorted(mskus)
 
 
 def city_shortfall(city_current: int, threshold: int) -> int:
@@ -1502,7 +1512,7 @@ def expand_city_warehouse_stock(agg: pd.DataFrame, settings: dict | None = None)
         excluded = excluded_warehouses(settings)
         if excluded:
             warehouses = warehouses[~warehouses["Location"].isin(excluded)]
-    all_mskus = sorted(stock["MSKU"].unique())
+    all_mskus = send_plan_msku_list(agg, settings)
     rows: list[dict] = []
 
     for _, wh in warehouses.iterrows():
