@@ -545,7 +545,7 @@ def order_skus_for_send_plan(plan: pd.DataFrame, selected_skus: list[str], inclu
             continue
         if not include_ok_skus and not sku_needs_attention(sku_plan):
             continue
-        total_gap = int(sku_plan["Shortfall"].sum()) if "Shortfall" in sku_plan.columns else 0
+        total_gap = total_city_gap_for_plan_rows(sku_plan)
         ordered.append((total_gap, str(sku), str(sku)))
     ordered.sort(key=lambda item: (-item[0], item[2]))
     return [sku for _, sku, _ in ordered]
@@ -558,6 +558,8 @@ def warehouse_rows_for_sku(plan: pd.DataFrame, sku: str, show_all_locations: boo
     if view.empty:
         return view
     view = enrich_send_plan_rows(view)
+    if "CityCurrent" in view.columns:
+        view["City total"] = view["CityCurrent"].astype(int)
     view = view.sort_values(["Gap", "Current"], ascending=[False, True]).reset_index(drop=True)
     return view
 
@@ -887,7 +889,18 @@ def send_plan_export_columns(view_mode: str) -> list[str]:
     if view_mode == "City":
         return ["MSKU", "City", "Current", "Threshold", "Gap", "Status", "Send qty", "Notes"]
     if view_mode == "By SKU":
-        return ["MSKU", "City", "Warehouse", "Current", "Threshold", "Gap", "Status", "Send qty", "Notes"]
+        return [
+            "MSKU",
+            "City",
+            "Warehouse",
+            "City total",
+            "Current",
+            "Threshold",
+            "Gap",
+            "Status",
+            "Send qty",
+            "Notes",
+        ]
     return ["Priority", "City", "Warehouse", "MSKU", "Current", "Threshold", "Gap", "Status", "Send qty", "Notes"]
 
 
@@ -923,8 +936,19 @@ def city_display_name(code: str) -> str:
 
 
 def threshold_for_msku(msku: str, settings: dict) -> int:
+    """Minimum stock target for an MSKU in a single city (summed across FCs in that city)."""
     overrides = settings.get("sku_overrides") or {}
     return int(overrides.get(str(msku).strip(), settings.get("global_threshold", 10)))
+
+
+def city_shortfall(city_current: int, threshold: int) -> int:
+    return max(0, threshold - city_current)
+
+
+def total_city_gap_for_plan_rows(plan_slice: pd.DataFrame) -> int:
+    if plan_slice.empty or "Shortfall" not in plan_slice.columns:
+        return 0
+    return int(plan_slice.groupby(["CityCode", "MSKU"], as_index=False)["Shortfall"].first()["Shortfall"].sum())
 
 
 def compute_low_stock_alerts(agg: pd.DataFrame, settings: dict) -> dict:
@@ -943,35 +967,44 @@ def compute_low_stock_alerts(agg: pd.DataFrame, settings: dict) -> dict:
     flagged_skus: set[tuple[str, str]] = set()
     alerts: list[dict] = []
 
-    for _, row in expanded.iterrows():
-        loc = row["Location"]
-        msku = str(row["MSKU"])
-        qty = int(row[STOCK_QTY_COL])
-        thresh = threshold_for_msku(msku, settings)
-        if qty <= thresh:
-            flagged_skus.add((loc, msku))
-            alerts.append(
-                {
-                    "MSKU": msku,
-                    "scope": "Per warehouse",
-                    "location": loc,
-                    "qty": qty,
-                    "threshold": thresh,
-                    "status": "LOW",
-                }
-            )
+    city_totals = (
+        expanded.groupby(["CityCode", "MSKU"], as_index=False)[STOCK_QTY_COL]
+        .sum()
+        .rename(columns={STOCK_QTY_COL: "CityCurrent"})
+    )
 
     flagged_locations: set[str] = set()
     flagged_cities: set[str] = set()
     location_alert_count: dict[str, int] = {}
     city_alert_count: dict[str, int] = {}
 
-    for loc, msku in flagged_skus:
-        flagged_locations.add(loc)
-        location_alert_count[loc] = location_alert_count.get(loc, 0) + 1
-        city = extract_city_code(loc)
+    for _, city_row in city_totals.iterrows():
+        city = str(city_row["CityCode"])
+        msku = str(city_row["MSKU"])
+        city_qty = int(city_row["CityCurrent"])
+        thresh = threshold_for_msku(msku, settings)
+        if city_qty > thresh:
+            continue
         flagged_cities.add(city)
         city_alert_count[city] = city_alert_count.get(city, 0) + 1
+        city_locs = expanded.loc[
+            (expanded["CityCode"] == city) & (expanded["MSKU"].astype(str) == msku),
+            "Location",
+        ].astype(str)
+        for loc in city_locs.unique():
+            flagged_skus.add((loc, msku))
+            flagged_locations.add(loc)
+            location_alert_count[loc] = location_alert_count.get(loc, 0) + 1
+        alerts.append(
+            {
+                "MSKU": msku,
+                "scope": "Per city",
+                "location": f"{city_display_name(city)} ({city})",
+                "qty": city_qty,
+                "threshold": thresh,
+                "status": "ZERO" if city_qty == 0 else "LOW",
+            }
+        )
 
     alerts.sort(key=lambda a: (a["location"], a["MSKU"]))
 
@@ -1026,15 +1059,18 @@ def build_scope_status_table(agg: pd.DataFrame, settings: dict) -> pd.DataFrame:
         msku_rows = agg[agg["MSKU"].astype(str) == msku]
 
         if scope == "per_warehouse":
+            city_qty_by_code = msku_rows.groupby("CityCode")[STOCK_QTY_COL].sum()
             for loc, grp in msku_rows.groupby("Location"):
                 qty = int(grp[STOCK_QTY_COL].sum())
+                city = str(grp["CityCode"].iloc[0])
+                city_qty = int(city_qty_by_code.get(city, qty))
                 rows.append(
                     {
                         "MSKU": msku,
                         "Location": loc,
                         "Qty": qty,
                         "Threshold": thresh,
-                        "Status": "LOW" if qty <= thresh else "OK",
+                        "Status": "LOW" if city_qty <= thresh else "OK",
                     }
                 )
         else:
@@ -1171,8 +1207,14 @@ def expand_city_warehouse_stock(agg: pd.DataFrame, settings: dict | None = None)
 
 
 def build_send_plan(agg: pd.DataFrame, settings: dict) -> pd.DataFrame:
-    """Warehouse-level send plan — zero stock shown at every FC missing an MSKU."""
+    """Warehouse-level send plan — thresholds apply to city totals (summed across FCs)."""
     expanded = expand_city_warehouse_stock(agg, settings)
+    city_current = (
+        expanded.groupby(["CityCode", "MSKU"], as_index=False)[STOCK_QTY_COL]
+        .sum()
+        .rename(columns={STOCK_QTY_COL: "CityCurrent"})
+    )
+    expanded = expanded.merge(city_current, on=["CityCode", "MSKU"], how="left")
     rows: list[dict] = []
 
     for _, row in expanded.iterrows():
@@ -1180,8 +1222,9 @@ def build_send_plan(agg: pd.DataFrame, settings: dict) -> pd.DataFrame:
         city = row["CityCode"]
         msku = str(row["MSKU"])
         current = int(row[STOCK_QTY_COL])
+        city_total = int(row["CityCurrent"])
         threshold = threshold_for_msku(msku, settings)
-        shortfall = max(0, threshold - current)
+        shortfall = city_shortfall(city_total, threshold)
         shortfall_pct = (shortfall / threshold * 100) if threshold > 0 else (100.0 if shortfall else 0.0)
         rows.append(
             {
@@ -1190,11 +1233,12 @@ def build_send_plan(agg: pd.DataFrame, settings: dict) -> pd.DataFrame:
                 "Warehouse": loc,
                 "MSKU": msku,
                 "Current": current,
+                "CityCurrent": city_total,
                 "Threshold": threshold,
                 "Shortfall": shortfall,
                 "Shortfall %": round(shortfall_pct, 1),
                 "Send qty": pd.NA,
-                "_low": current <= threshold,
+                "_low": city_total <= threshold,
                 "_zero": current == 0,
             }
         )
@@ -1208,7 +1252,7 @@ def build_send_plan(agg: pd.DataFrame, settings: dict) -> pd.DataFrame:
 
 
 def aggregate_send_plan_by_city(plan: pd.DataFrame) -> pd.DataFrame:
-    """Roll warehouse rows up to city + MSKU; Gap is sum of per-FC shortfalls (threshold is per FC)."""
+    """Roll warehouse rows up to city + MSKU; threshold and gap are per city."""
     if plan.empty:
         return plan.copy()
 
@@ -1217,17 +1261,16 @@ def aggregate_send_plan_by_city(plan: pd.DataFrame) -> pd.DataFrame:
         .agg(
             Current=("Current", "sum"),
             Threshold=("Threshold", "first"),
-            Gap=("Shortfall", "sum"),
+            Shortfall=("Shortfall", "first"),
             Send_qty=("Send qty", sum_send_qty),
             FCs=("Warehouse", "nunique"),
         )
         .rename(columns={"Send_qty": "Send qty"})
     )
-    grouped["Gap"] = grouped["Gap"].astype(int)
-    grouped["Shortfall"] = grouped["Gap"]
+    grouped["Gap"] = grouped["Shortfall"].astype(int)
     grouped["Shortfall %"] = grouped.apply(
-        lambda r: round(r["Gap"] / (r["Threshold"] * r["FCs"]) * 100, 1)
-        if r["Threshold"] > 0 and r["FCs"] > 0
+        lambda r: round(r["Gap"] / r["Threshold"] * 100, 1)
+        if r["Threshold"] > 0
         else (100.0 if r["Gap"] else 0.0),
         axis=1,
     )
@@ -1251,11 +1294,14 @@ def send_plan_summary(plan: pd.DataFrame) -> dict:
     if plan.empty:
         return {"cities": 0, "skus": 0, "units_short": 0, "warehouses": 0}
     low = plan[plan["_low"]] if "_low" in plan.columns else plan[plan["Shortfall"] > 0]
+    if low.empty:
+        return {"cities": 0, "skus": 0, "units_short": 0, "warehouses": 0}
+    low_lines = low.drop_duplicates(subset=["CityCode", "MSKU"])
     return {
-        "cities": int(low["CityCode"].nunique()) if not low.empty else 0,
-        "warehouses": int(low["Warehouse"].nunique()) if not low.empty else 0,
-        "skus": len(low),
-        "units_short": int(low["Shortfall"].sum()) if not low.empty else 0,
+        "cities": int(low_lines["CityCode"].nunique()),
+        "warehouses": int(low["Warehouse"].nunique()),
+        "skus": len(low_lines),
+        "units_short": int(low_lines["Shortfall"].sum()),
     }
 
 
@@ -1719,7 +1765,10 @@ def build_warehouse_map(
 
 def render_settings_panel(settings: dict, agg: pd.DataFrame | None = None) -> dict:
     st.subheader("⚙️ Alert thresholds")
-    st.caption("Each warehouse is checked separately. If an MSKU appears anywhere, every FC in selected cities is listed (0 where absent).")
+    st.caption(
+        "Thresholds are **per city**: compare total stock in a city (all FCs combined) to the target. "
+        "Every FC in selected cities is still listed in the send plan (0 where absent)."
+    )
 
     if "settings_enabled" not in st.session_state:
         st.session_state.settings_enabled = bool(settings.get("enabled", True))
@@ -1732,7 +1781,7 @@ def render_settings_panel(settings: dict, agg: pd.DataFrame | None = None) -> di
         on_change=_persist_alert_settings,
     )
     settings["global_threshold"] = st.number_input(
-        "Default threshold (all MSKUs)",
+        "Default threshold per city (all MSKUs)",
         min_value=0,
         key="settings_global_threshold",
         on_change=_persist_alert_settings,
@@ -1927,7 +1976,16 @@ def prepare_send_plan_table(
         display_cols = ["Priority", "City", "MSKU", "Current", "Threshold", "Gap", "Status", "Send qty"]
     else:
         display_cols = [
-            "Priority", "City", "Warehouse", "MSKU", "Current", "Threshold", "Gap", "Status", "Send qty"
+            "Priority",
+            "City",
+            "Warehouse",
+            "MSKU",
+            "City total",
+            "Current",
+            "Threshold",
+            "Gap",
+            "Status",
+            "Send qty",
         ]
 
     if not show_all:
@@ -1937,6 +1995,8 @@ def prepare_send_plan_table(
         return view, display_cols
 
     view = enrich_send_plan_rows(view)
+    if "CityCurrent" in view.columns:
+        view["City total"] = view["CityCurrent"].astype(int)
     if "Send qty" not in view.columns:
         view["Send qty"] = pd.NA
 
@@ -1952,8 +2012,9 @@ def send_plan_column_config(view_mode: str) -> dict:
         "Priority": st.column_config.NumberColumn("Priority", disabled=True),
         "City": st.column_config.TextColumn("City", disabled=True),
         "MSKU": st.column_config.TextColumn("MSKU", disabled=True),
-        "Current": st.column_config.NumberColumn("Current", disabled=True),
-        "Threshold": st.column_config.NumberColumn("Threshold (per FC)", disabled=True),
+        "Current": st.column_config.NumberColumn("Current (FC)", disabled=True),
+        "City total": st.column_config.NumberColumn("City total", disabled=True),
+        "Threshold": st.column_config.NumberColumn("Threshold (city)", disabled=True),
         "Gap": st.column_config.NumberColumn("Gap", disabled=True),
         "Status": st.column_config.TextColumn("Status", disabled=True),
         "Send qty": st.column_config.NumberColumn("Send qty", min_value=0, step=1),
@@ -1964,14 +2025,33 @@ def send_plan_column_config(view_mode: str) -> dict:
 
 
 def send_plan_destination_columns() -> list[str]:
-    return ["Warehouse", "City", "Current", "Threshold", "Gap", "Status", "Send qty"]
+    return ["Warehouse", "City", "City total", "Current", "Threshold", "Gap", "Status", "Send qty"]
 
 
 def fill_send_qty_for_rows(rows: pd.DataFrame, qty_store: dict, zero_only: bool = False) -> None:
-    for _, row in rows.iterrows():
-        if zero_only and int(row["Current"]) != 0:
+    """Assign each city's gap once to the lowest-stock FC (zeros first when zero_only)."""
+    if rows.empty:
+        return
+    work = rows.copy()
+    if "CityCode" not in work.columns:
+        for _, row in work.iterrows():
+            if zero_only and int(row["Current"]) != 0:
+                continue
+            qty_store[send_plan_row_key(row, "Warehouse")] = suggested_send_qty(row)
+        return
+
+    for (_, _), grp in work.groupby(["CityCode", "MSKU"], sort=False):
+        city_gap = int(grp.iloc[0].get("Shortfall", grp.iloc[0].get("Gap", 0)))
+        if city_gap <= 0:
             continue
-        qty_store[send_plan_row_key(row, "Warehouse")] = suggested_send_qty(row)
+        candidates = grp.sort_values(["Current", "Warehouse"], ascending=[True, True])
+        if zero_only:
+            zero_rows = candidates[candidates["Current"] == 0]
+            if zero_rows.empty:
+                continue
+            candidates = zero_rows
+        target = candidates.iloc[0]
+        qty_store[send_plan_row_key(target, "Warehouse")] = city_gap
 
 
 def render_send_plan_sku_sections(
@@ -1996,7 +2076,7 @@ def render_send_plan_sku_sections(
         sku_plan = plan[plan["MSKU"].astype(str) == str(sku)]
         threshold = int(sku_plan["Threshold"].iloc[0]) if not sku_plan.empty else 0
         total_current = int(sku_plan["Current"].sum())
-        total_gap = int(sku_plan["Shortfall"].sum())
+        total_gap = total_city_gap_for_plan_rows(sku_plan)
         needs = sku_needs_attention(sku_plan)
 
         table = warehouse_rows_for_sku(plan, sku, show_all_locations)
@@ -2009,7 +2089,7 @@ def render_send_plan_sku_sections(
 
         label = (
             f"{sku} — {total_current:,} units · gap {total_gap:,} · "
-            f"threshold {threshold} per FC · planned send {planned_send:,}"
+            f"threshold {threshold} per city · planned send {planned_send:,}"
         )
         if needs:
             label = f"⚠️ {label}"
@@ -2062,7 +2142,8 @@ def render_send_plan_tab(
     st.subheader("📋 Send Plan")
     st.caption(
         "Plan replenishment **by SKU**: open each MSKU to see warehouse destinations, "
-        "current units, per-FC threshold, and gap. Threshold is **per fulfillment center**."
+        "current units at each FC, **city total**, city-level threshold, and gap. "
+        "Thresholds apply to **total stock per city** (all FCs in that city combined)."
     )
 
     all_skus = sorted(plan["MSKU"].astype(str).unique())
@@ -2115,12 +2196,19 @@ def render_send_plan_tab(
                     rows = warehouse_rows_for_sku(plan, sku, show_all_locations)
                     fill_send_qty_for_rows(rows, qty_store, zero_only=False)
             else:
-                table, _ = prepare_send_plan_table(
-                    plan, selected_skus, view_mode, show_all_locations, "Priority", True
-                )
-                key_mode = "City" if view_mode == "City" else "Warehouse"
-                for _, row in table.iterrows():
-                    qty_store[send_plan_row_key(row, key_mode)] = suggested_send_qty(row)
+                visible = plan[plan["MSKU"].astype(str).isin(selected_skus)].copy()
+                if view_mode == "City":
+                    visible = aggregate_send_plan_by_city(visible)
+                    if not show_all_locations:
+                        visible = visible[visible.apply(lambda r: send_plan_includes_row(r, "City"), axis=1)]
+                    for _, row in visible.iterrows():
+                        qty_store[send_plan_row_key(row, "City")] = suggested_send_qty(row)
+                else:
+                    if not show_all_locations:
+                        visible = visible[
+                            visible.apply(lambda r: send_plan_includes_row(r, "Warehouse"), axis=1)
+                        ]
+                    fill_send_qty_for_rows(visible, qty_store, zero_only=False)
             st.session_state[store_key] = qty_store
             st.rerun()
     with fill2:
@@ -2130,13 +2218,20 @@ def render_send_plan_tab(
                     rows = warehouse_rows_for_sku(plan, sku, show_all_locations)
                     fill_send_qty_for_rows(rows, qty_store, zero_only=True)
             else:
-                table, _ = prepare_send_plan_table(
-                    plan, selected_skus, view_mode, show_all_locations, "Priority", True
-                )
-                key_mode = "City" if view_mode == "City" else "Warehouse"
-                for _, row in table.iterrows():
-                    if int(row["Current"]) == 0:
-                        qty_store[send_plan_row_key(row, key_mode)] = suggested_send_qty(row)
+                visible = plan[plan["MSKU"].astype(str).isin(selected_skus)].copy()
+                if view_mode == "City":
+                    visible = aggregate_send_plan_by_city(visible)
+                    if not show_all_locations:
+                        visible = visible[visible.apply(lambda r: send_plan_includes_row(r, "City"), axis=1)]
+                    for _, row in visible.iterrows():
+                        if int(row["Current"]) == 0:
+                            qty_store[send_plan_row_key(row, "City")] = suggested_send_qty(row)
+                else:
+                    if not show_all_locations:
+                        visible = visible[
+                            visible.apply(lambda r: send_plan_includes_row(r, "Warehouse"), axis=1)
+                        ]
+                    fill_send_qty_for_rows(visible, qty_store, zero_only=True)
             st.session_state[store_key] = qty_store
             st.rerun()
     with fill3:
@@ -2223,7 +2318,7 @@ def render_send_plan_tab(
         f"Exported: {format_export_date(datetime.now())}",
         f"View: {export_view_mode}",
         f"SKUs: {', '.join(selected_skus)}",
-        "Threshold: per fulfillment center",
+        "Threshold: per city (stock summed across FCs in that city)",
     ]
     if export_date:
         export_meta.append(f"Ledger data date: {export_date}")
