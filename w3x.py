@@ -708,7 +708,11 @@ def save_history(history: list[dict]) -> None:
         json.dump(history, f, indent=2)
 
 
-def make_snapshot(agg: pd.DataFrame, ledger_data_date: str | None = None) -> dict:
+def make_snapshot(
+    agg: pd.DataFrame,
+    ledger_data_date: str | None = None,
+    city_shipments: list[dict] | None = None,
+) -> dict:
     now = datetime.now()
     records = []
     has_transit = "In Transit Between Warehouses" in agg.columns
@@ -723,7 +727,7 @@ def make_snapshot(agg: pd.DataFrame, ledger_data_date: str | None = None) -> dic
             rec["in_transit"] = int(row["In Transit Between Warehouses"])
         records.append(rec)
 
-    return {
+    snapshot = {
         "id": now.strftime("%Y%m%d_%H%M%S"),
         "uploaded_at": now.strftime("%Y-%m-%d %H:%M:%S"),
         "ledger_data_date": ledger_data_date,
@@ -735,10 +739,17 @@ def make_snapshot(agg: pd.DataFrame, ledger_data_date: str | None = None) -> dic
             "total_in_transit": int(agg["In Transit Between Warehouses"].sum()) if has_transit else 0,
         },
     }
+    if city_shipments:
+        snapshot["city_shipments"] = city_shipments
+    return snapshot
 
 
-def append_snapshot(agg: pd.DataFrame, ledger_data_date: str | None = None) -> dict:
-    snapshot = make_snapshot(agg, ledger_data_date)
+def append_snapshot(
+    agg: pd.DataFrame,
+    ledger_data_date: str | None = None,
+    city_shipments: list[dict] | None = None,
+) -> dict:
+    snapshot = make_snapshot(agg, ledger_data_date, city_shipments)
     history = load_history()
     history.insert(0, snapshot)
     save_history(history)
@@ -768,6 +779,312 @@ def agg_from_snapshot(snapshot: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
         city_parts["In Transit Between Warehouses"] = "sum"
     city_agg = agg.groupby(["CityCode", "MSKU"], as_index=False).agg(city_parts)
     return agg, city_agg
+
+
+def extract_city_shipments_from_ledger(df: pd.DataFrame) -> list[dict]:
+    """Per-city customer shipments for a ledger CSV (stored on snapshot for movement hybrid)."""
+    work = df.copy()
+    work.columns = [c.strip() for c in work.columns]
+    msku_col = _find_col(work, "MSKU")
+    disp_col = _find_col(work, "Disposition")
+    loc_col = _find_col(work, "Location")
+    ship_col = _find_col(work, "Customer Shipments")
+    if not all([msku_col, disp_col, loc_col, ship_col]):
+        return []
+
+    work[disp_col] = work[disp_col].astype(str).str.strip().str.upper()
+    sellable = work[work[disp_col] == "SELLABLE"].copy()
+    if sellable.empty:
+        return []
+
+    sellable["CityCode"] = sellable[loc_col].apply(extract_city_code)
+    sellable[ship_col] = pd.to_numeric(sellable[ship_col], errors="coerce").fillna(0)
+    grouped = sellable.groupby(["CityCode", msku_col], as_index=False)[ship_col].sum()
+    records: list[dict] = []
+    for _, row in grouped.iterrows():
+        units = int(abs(row[ship_col]))
+        if units <= 0:
+            continue
+        records.append(
+            {
+                "CityCode": str(row["CityCode"]),
+                "MSKU": str(row[msku_col]),
+                "units_shipped": units,
+            }
+        )
+    return records
+
+
+def parse_movement_snapshot_date(snap: dict) -> pd.Timestamp | None:
+    raw = snap.get("ledger_data_date")
+    if raw:
+        text = str(raw).strip()
+        parsed = pd.to_datetime(text, errors="coerce")
+        if pd.isna(parsed):
+            parsed = pd.to_datetime(text, dayfirst=True, errors="coerce")
+        if not pd.isna(parsed):
+            return pd.Timestamp(parsed).normalize()
+    uploaded = snap.get("uploaded_at")
+    if uploaded:
+        parsed = pd.to_datetime(uploaded, errors="coerce")
+        if not pd.isna(parsed):
+            return pd.Timestamp(parsed).normalize()
+    return None
+
+
+def snapshots_for_movement(settings: dict) -> tuple[list[dict], list[str]]:
+    """Timeline of snapshots with dates, deduped by ledger day; returns warnings."""
+    warnings: list[str] = []
+    allowed_cities = set(effective_selected_cities(settings, None))
+    dated: list[tuple[pd.Timestamp, dict, bool]] = []
+
+    for snap in load_history():
+        when = parse_movement_snapshot_date(snap)
+        if when is None:
+            warnings.append(f"Snapshot {snap.get('id', '?')} has no usable date — skipped.")
+            continue
+        used_upload_fallback = not snap.get("ledger_data_date")
+        dated.append((when, snap, used_upload_fallback))
+
+    if not dated:
+        return [], warnings
+
+    dated.sort(key=lambda item: (item[0], item[1].get("uploaded_at", "")))
+    by_day: dict[pd.Timestamp, tuple[dict, bool]] = {}
+    for when, snap, fallback in dated:
+        by_day[when] = (snap, fallback)
+
+    timeline = [by_day[day][0] for day in sorted(by_day)]
+    if any(by_day[day][1] for day in by_day):
+        warnings.append("Some snapshots use upload time instead of ledger date.")
+    return timeline, warnings
+
+
+def city_stock_lookup_from_snapshot(snap: dict, cities: set[str]) -> dict[tuple[str, str], int]:
+    df = pd.DataFrame(snap.get("records") or [])
+    if df.empty:
+        return {}
+    if cities:
+        df = df[df["CityCode"].astype(str).isin(cities)]
+    grouped = df.groupby(["CityCode", "MSKU"], as_index=False)["sellable"].sum()
+    return {
+        (str(row["CityCode"]), str(row["MSKU"])): int(row["sellable"])
+        for _, row in grouped.iterrows()
+    }
+
+
+def city_shipments_lookup_from_snapshot(snap: dict) -> dict[tuple[str, str], int]:
+    out: dict[tuple[str, str], int] = {}
+    for rec in snap.get("city_shipments") or []:
+        key = (str(rec.get("CityCode")), str(rec.get("MSKU")))
+        out[key] = int(rec.get("units_shipped", 0))
+    return out
+
+
+def build_movement_intervals(settings: dict) -> tuple[list[dict], list[str]]:
+    timeline, warnings = snapshots_for_movement(settings)
+    if len(timeline) < 2:
+        return [], warnings
+
+    cities = set(effective_selected_cities(settings, None))
+    intervals: list[dict] = []
+
+    for prev_snap, next_snap in zip(timeline, timeline[1:]):
+        d_prev = parse_movement_snapshot_date(prev_snap)
+        d_next = parse_movement_snapshot_date(next_snap)
+        if d_prev is None or d_next is None:
+            continue
+        days = max(1, int((d_next - d_prev).days))
+        stock_prev = city_stock_lookup_from_snapshot(prev_snap, cities)
+        stock_next = city_stock_lookup_from_snapshot(next_snap, cities)
+        shipments = city_shipments_lookup_from_snapshot(next_snap)
+
+        keys = set(stock_prev) | set(stock_next) | set(shipments)
+        units: dict[tuple[str, str], int] = {}
+        for key in keys:
+            if key in shipments and shipments[key] > 0:
+                units[key] = shipments[key]
+            else:
+                prev_q = stock_prev.get(key, 0)
+                next_q = stock_next.get(key, 0)
+                units[key] = max(0, prev_q - next_q)
+
+        intervals.append(
+            {
+                "end_date": d_next,
+                "start_date": d_prev,
+                "days": days,
+                "units": units,
+                "used_shipments": bool(shipments),
+            }
+        )
+
+    return intervals, warnings
+
+
+def movement_skus_from_timeline(settings: dict) -> list[str]:
+    cities = set(effective_selected_cities(settings, None))
+    mskus: set[str] = set()
+    timeline, _ = snapshots_for_movement(settings)
+    for snap in timeline:
+        for rec in snap.get("records") or []:
+            if cities and str(rec.get("CityCode")) not in cities:
+                continue
+            mskus.add(str(rec.get("MSKU")))
+    return sorted(mskus)
+
+
+def movement_date_bounds(settings: dict) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+    timeline, _ = snapshots_for_movement(settings)
+    if not timeline:
+        return None, None
+    dates = [parse_movement_snapshot_date(s) for s in timeline]
+    dates = [d for d in dates if d is not None]
+    if not dates:
+        return None, None
+    return min(dates), max(dates)
+
+
+def aggregate_movement_for_sku(
+    settings: dict,
+    msku: str,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> pd.DataFrame:
+    intervals, _ = build_movement_intervals(settings)
+    cities = sorted(effective_selected_cities(settings, None))
+    msku = str(msku)
+    rows: list[dict] = []
+
+    for city in cities:
+        total_units = 0
+        total_days = 0
+        intervals_used = 0
+        for interval in intervals:
+            end_date = interval["end_date"]
+            if end_date < start or end_date > end:
+                continue
+            units = interval["units"].get((city, msku), 0)
+            total_units += int(units)
+            total_days += int(interval["days"])
+            if units > 0:
+                intervals_used += 1
+
+        if total_units == 0 and intervals_used == 0:
+            continue
+        rate = (total_units / total_days) if total_days > 0 else 0.0
+        rows.append(
+            {
+                "CityCode": city,
+                "City": f"{city_display_name(city)} ({city})",
+                "Units sold": total_units,
+                "Units per day": round(rate, 2),
+                "Intervals": intervals_used,
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    total = int(df["Units sold"].sum())
+    df["% of total"] = df["Units sold"].apply(
+        lambda u: round(100.0 * u / total, 1) if total > 0 else 0.0
+    )
+    return df.sort_values("Units per day", ascending=False).reset_index(drop=True)
+
+
+def render_movement_tab(settings: dict, source_key: str) -> None:
+    st.subheader("📈 SKU movement by city")
+    st.caption(
+        "Estimates outbound volume from **saved ledger snapshots**. Uses **Customer Shipments** when stored "
+        "on a snapshot; otherwise infers movement from **stock drops** between ledger dates. "
+        "Receipts and transfers can make estimates approximate."
+    )
+
+    timeline, timeline_warnings = snapshots_for_movement(settings)
+    for msg in timeline_warnings:
+        st.caption(f"Note: {msg}")
+
+    if len(timeline) < 2:
+        st.info(
+            "Save **at least two** ledger CSVs on **different ledger dates** under History & Settings "
+            "to compare movement across cities."
+        )
+        return
+
+    mskus = movement_skus_from_timeline(settings)
+    if not mskus:
+        st.info("No MSKUs found in saved snapshots for your selected cities.")
+        return
+
+    d_min, d_max = movement_date_bounds(settings)
+    if d_min is None or d_max is None:
+        st.warning("Could not determine ledger dates from history.")
+        return
+
+    fc1, fc2 = st.columns([2, 1])
+    with fc1:
+        pick_msku = st.selectbox("MSKU", options=mskus, key=f"movement_msku_{source_key}")
+    with fc2:
+        sort_by = st.radio(
+            "Sort by",
+            ["Units per day", "Units sold"],
+            horizontal=True,
+            key=f"movement_sort_{source_key}",
+        )
+
+    default_start = d_min.date()
+    default_end = d_max.date()
+    dr = st.date_input(
+        "Ledger date range",
+        value=(default_start, default_end),
+        min_value=default_start,
+        max_value=default_end,
+        key=f"movement_range_{source_key}",
+    )
+    if isinstance(dr, tuple) and len(dr) == 2:
+        range_start, range_end = dr
+    else:
+        range_start = range_end = dr if not isinstance(dr, tuple) else dr[0]
+
+    start_ts = pd.Timestamp(range_start).normalize()
+    end_ts = pd.Timestamp(range_end).normalize()
+    if start_ts > end_ts:
+        st.warning("Start date must be on or before end date.")
+        return
+
+    summary = aggregate_movement_for_sku(settings, pick_msku, start_ts, end_ts)
+    if summary.empty:
+        st.info("No movement estimated for this MSKU in the selected range and cities.")
+        return
+
+    top = summary.iloc[0]
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Top city", str(top["CityCode"]))
+    m2.metric("Units sold (range)", int(summary["Units sold"].sum()))
+    m3.metric("Snapshots in timeline", len(timeline))
+
+    display = summary.sort_values(sort_by, ascending=False).reset_index(drop=True)
+    st.dataframe(display, use_container_width=True, hide_index=True)
+
+    chart_df = display.set_index("City")[["Units per day"]]
+    st.bar_chart(chart_df)
+
+    st.download_button(
+        "⬇️ Export movement CSV",
+        data=export_csv_with_metadata(
+            display,
+            [
+                f"Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                f"MSKU: {pick_msku}",
+                f"Ledger range: {range_start} to {range_end}",
+            ],
+        ),
+        file_name=f"movement_{pick_msku}_{range_start}_{range_end}.csv",
+        mime="text/csv",
+        key=f"movement_export_{source_key}",
+    )
 
 
 def parse_ledger_csv(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame | None]:
@@ -2701,8 +3018,8 @@ def render_app(
 
     render_summary_banner(send_plan)
 
-    tab_send, tab_overview, tab_map, tab_history = st.tabs(
-        ["📋 Send Plan", "📊 Overview", "🗺️ Map", "⚙️ History & Settings"]
+    tab_send, tab_overview, tab_map, tab_movement, tab_history = st.tabs(
+        ["📋 Send Plan", "📊 Overview", "🗺️ Map", "📈 SKU Movement", "⚙️ History & Settings"]
     )
 
     with tab_send:
@@ -2713,6 +3030,9 @@ def render_app(
 
     with tab_map:
         render_map_tab(agg, settings, alerts_data)
+
+    with tab_movement:
+        render_movement_tab(settings, source_key)
 
     with tab_history:
         render_history_panel()
@@ -2816,7 +3136,9 @@ if uploaded_file is not None and not st.session_state.get("prefer_history"):
     save_pref = st.session_state.get("upload_save_pref")
     if st.session_state.get("save_decision_for") != upload_sig:
         if save_pref == "always":
-            snap = append_snapshot(agg, ledger_data_date)
+            snap = append_snapshot(
+                agg, ledger_data_date, extract_city_shipments_from_ledger(df)
+            )
             st.session_state.active_snapshot_id = snap["id"]
             st.session_state.save_decision_for = upload_sig
             st.session_state.prefer_history = False
@@ -2833,7 +3155,9 @@ if uploaded_file is not None and not st.session_state.get("prefer_history"):
                 if st.button("✅ Yes, save to history", type="primary"):
                     if remember:
                         st.session_state.upload_save_pref = "always"
-                    snap = append_snapshot(agg, ledger_data_date)
+                    snap = append_snapshot(
+                        agg, ledger_data_date, extract_city_shipments_from_ledger(df)
+                    )
                     st.session_state.active_snapshot_id = snap["id"]
                     st.session_state.save_decision_for = upload_sig
                     st.session_state.prefer_history = False
